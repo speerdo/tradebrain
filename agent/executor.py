@@ -36,6 +36,7 @@ class PaperPosition:
     status: str = "open"
     exit_price: float | None = None
     pnl_usdc: float = 0.0
+    realized_partial: float = 0.0  # PnL already booked by partial take-profits
     tax_treatment: str = "1256"
     product_type: str = "perp"
 
@@ -115,7 +116,9 @@ class Executor:
             return OrderResult(success=False, error=f"No position: {product_id}")
         if exit_price is None:
             exit_price = pos.entry_price
-        pnl = self._calc_pnl(pos, exit_price)
+        # Final PnL = PnL on the remaining size + anything already banked
+        # by partial take-profits.
+        pnl = self._calc_pnl(pos, exit_price) + pos.realized_partial
         pos.exit_price = exit_price
         pos.pnl_usdc = pnl
         pos.status = "closed"
@@ -130,6 +133,40 @@ class Executor:
                 )
             except Exception as exc:
                 logger.warning(f"Close notification failed: {exc}")
+        return OrderResult(success=True, filled_price=exit_price)
+
+    async def reduce_position(self, product_id: str, exit_price: float,
+                              fraction: float) -> OrderResult:
+        """
+        Close `fraction` (0..1) of a position at exit_price — partial take-profit.
+
+        Books the realized PnL on the closed portion into `realized_partial`
+        (included in the final PnL when the remainder closes) and shrinks
+        size/margin proportionally. Paper mode only for now — live would issue
+        a reduce-only order for the fraction.
+        """
+        pos = self.paper_positions.get(product_id)
+        if pos is None:
+            return OrderResult(success=False, error=f"No position: {product_id}")
+        if not pos.is_paper:
+            return OrderResult(success=False, error="Partial close not supported for live positions yet")
+        fraction = max(0.0, min(1.0, fraction))
+        if fraction <= 0:
+            return OrderResult(success=False, error="Fraction must be > 0")
+
+        closed_notional = pos.size_usdc * fraction
+        if pos.direction == "long":
+            realized = (exit_price - pos.entry_price) / pos.entry_price * closed_notional
+        else:
+            realized = (pos.entry_price - exit_price) / pos.entry_price * closed_notional
+
+        pos.realized_partial += realized
+        pos.size_usdc -= closed_notional
+        pos.margin_usdc *= (1 - fraction)
+        logger.info(
+            f"📄 PAPER PARTIAL: closed {fraction:.0%} of {pos.display_name} "
+            f"@ {exit_price:.2f} banked ${realized:+.2f} (remaining ${pos.size_usdc:.2f})"
+        )
         return OrderResult(success=True, filled_price=exit_price)
 
     @staticmethod

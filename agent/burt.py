@@ -39,6 +39,7 @@ TUNABLE_CONFIG: dict[str, dict] = {
     "take_profit_rr":    {"type": "float",  "min": 0.5,  "max": 10.0},
     "fixed_stop_pct":    {"type": "float",  "min": 0.005, "max": 0.10},
     "stop_loss_method":  {"type": "enum",   "choices": ["atr", "fixed"]},
+    "signal_model":      {"type": "str",    "min": None, "max": None},
     "strategy":          {"type": "enum",   "choices": ["rsi_macd", "bollinger", "ema_pullback", "donchian_breakout"]},
     "signal_interval":   {"type": "int",    "min": 60,   "max": 3600},
     "max_watchlist":     {"type": "int",    "min": 1,    "max": 20},
@@ -612,6 +613,10 @@ class Burt:
                         coerced = str(raw_value)
                         if coerced not in spec["choices"]:
                             raise ValueError(f"must be one of {spec['choices']}")
+                    elif spec["type"] == "str":
+                        coerced = str(raw_value).strip()
+                        if not coerced:
+                            raise ValueError("must be a non-empty string")
                     else:
                         raise ValueError("unknown spec type")
                 except (ValueError, TypeError) as exc:

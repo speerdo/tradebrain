@@ -62,6 +62,7 @@ class Config(BaseModel):
     take_profit_rr: float = Field(default=2.0)
     fixed_stop_pct: float = Field(default=0.02)
     stop_loss_method: str = Field(default="atr")
+    signal_model: str = Field(default="moonshotai/kimi-k2.6")
 
     # ------------------------------------------------------------------
     # Validators

@@ -16,6 +16,7 @@ from loguru import logger
 from agent.coinbase_client import CoinbaseClient
 from agent.indicator_engine import compute_screener_indicators
 from agent.database import get_db
+from agent.derivatives import DerivativesContext
 import config
 
 
@@ -47,6 +48,7 @@ class Screener:
     def __init__(self, cb: CoinbaseClient):
         self.cb = cb
         self.cfg = config.get_config()
+        self._derivatives = DerivativesContext()
 
     async def run(self, max_watchlist: int | None = None) -> list[str]:
         max_watchlist = max_watchlist or self.cfg.max_watchlist
@@ -82,6 +84,13 @@ class Screener:
         candle_map = await self.cb.get_candles_multi(
             [p.product_id for p in candidates], "ONE_HOUR"
         )
+
+        # 4a. Record derivatives snapshots (C3) — funding + OI for each candidate
+        for p in candidates:
+            if p.funding_rate is not None or p.open_interest is not None:
+                await self._derivatives.record_snapshot(
+                    p.product_id, p.funding_rate, p.open_interest, p.mark_price
+                )
 
         # 5. Score
         scores: list[ScreenerScore] = []

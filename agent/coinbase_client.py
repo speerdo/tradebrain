@@ -235,6 +235,7 @@ class CoinbaseClient:
         granularity: str = "FIFTEEN_MINUTE",
         start: int | None = None,
         end: int | None = None,
+        limit: int | None = None,
     ) -> list[CbCandle]:
         """Fetch OHLCV candles. Max 300 per request."""
         params = {"granularity": granularity}
@@ -242,6 +243,8 @@ class CoinbaseClient:
             params["start"] = str(start)
         if end:
             params["end"] = str(end)
+        if limit:
+            params["limit"] = str(limit)
 
         data = await self._request(
             "GET",

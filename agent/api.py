@@ -78,6 +78,7 @@ async def get_status() -> dict:
         "atr_multiplier": cfg.atr_multiplier,
         "take_profit_rr": cfg.take_profit_rr,
         "stop_loss_method": cfg.stop_loss_method,
+        "signal_model": cfg.signal_model,
         "signal_interval": cfg.signal_interval,
         "max_watchlist": cfg.max_watchlist,
         "circuit_breaker_active": rm_state.circuit_breaker_active if rm_state else False,
@@ -117,6 +118,18 @@ async def get_stats() -> dict:
     db = await get_db()
     stats = await db.get_today_stats()
     return stats
+
+
+@app.get("/api/analytics")
+async def get_analytics() -> dict:
+    from agent.analytics import compute_analytics
+    return await compute_analytics()
+
+
+@app.get("/api/analytics/review")
+async def get_weekly_review() -> dict:
+    from agent.analytics import weekly_self_review
+    return {"review": await weekly_self_review()}
 
 
 @app.get("/api/watchlist")

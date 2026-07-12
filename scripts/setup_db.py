@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS signals (
     rsi_15m         FLOAT,
     macd_hist_15m   FLOAT,
     atr_15m         FLOAT,
-    price           FLOAT
+    price           FLOAT,
+    model           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trades (
@@ -143,8 +144,71 @@ INSERT INTO agent_config (key, value) VALUES
     ('min_confidence', '0.65'),
     ('atr_multiplier', '1.5'),
     ('take_profit_rr', '2.0'),
-    ('stop_loss_method', 'atr')
+    ('stop_loss_method', 'atr'),
+    ('signal_model', 'moonshotai/kimi-k2.6')
 ON CONFLICT (key) DO NOTHING;
+
+-- =========================================================================
+-- MIGRATIONS (additive only — never drop columns)
+-- Run idempotently on every setup so existing DBs pick up new columns.
+-- =========================================================================
+
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS model TEXT;
+
+-- =========================================================================
+-- DERIVATIVES CONTEXT (C3) — funding rate + open interest snapshots
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS funding_snapshots (
+    id              SERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    symbol          TEXT NOT NULL,
+    funding_rate    FLOAT NOT NULL,
+    funding_annual  FLOAT,
+    mark_price      FLOAT
+);
+CREATE INDEX IF NOT EXISTS idx_funding_snap_created ON funding_snapshots(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_funding_snap_symbol ON funding_snapshots(symbol, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS oi_snapshots (
+    id              SERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    symbol          TEXT NOT NULL,
+    open_interest   FLOAT NOT NULL,
+    mark_price      FLOAT
+);
+CREATE INDEX IF NOT EXISTS idx_oi_snap_created ON oi_snapshots(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_oi_snap_symbol ON oi_snapshots(symbol, created_at DESC);
+
+-- =========================================================================
+-- SENTIMENT & NEWS (C4) — Fear & Greed + CryptoPanic cache
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS sentiment_cache (
+    id              SERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    source          TEXT NOT NULL,           -- 'fear_greed' | 'cryptopanic'
+    symbol          TEXT,                    -- NULL for global (Fear & Greed)
+    value           FLOAT,                   -- F&G value 0-100
+    classification  TEXT,                    -- F&G: 'Extreme Fear' etc.
+    raw             JSONB                    -- raw API response
+);
+CREATE INDEX IF NOT EXISTS idx_sentiment_created ON sentiment_cache(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sentiment_source ON sentiment_cache(source, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS news_cache (
+    id              SERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    symbol          TEXT,
+    title           TEXT NOT NULL,
+    url             TEXT,
+    sentiment       TEXT,                    -- 'positive' | 'negative' | 'neutral'
+    votes_positive  INT DEFAULT 0,
+    votes_negative  INT DEFAULT 0,
+    published_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_news_created ON news_cache(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_news_symbol ON news_cache(symbol, created_at DESC);
 """
 
 PGVECTOR_INDEX_SQL = """

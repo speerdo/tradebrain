@@ -22,15 +22,29 @@ class BaseStrategy(ABC):
     Abstract base for all TradeBrain strategies.
 
     A strategy defines:
-      - build_prompt(indicators) -> str     (injected into the LLM prompt)
-      - parse_response(resp, indicators) -> SignalResult
+      - check_entry(indicators) -> SignalResult  (deterministic rules — backtestable)
+      - build_prompt(indicators) -> str           (injected into the LLM prompt)
+      - parse_response(resp, indicators) -> SignalResult  (gates LLM output through hard rules)
+
+    `check_entry` is pure-Python, no LLM. It encodes the same entry conditions
+    described in the prompt so the backtester can replay them bar-by-bar without
+    API calls. `parse_response` remains the live path: it takes the LLM's
+    candidate signal and re-checks the hard gates so the model can't hallucinate
+    a trade the rules don't allow.
+
+    Regime compatibility:
+      - `compatible_regimes` lists the regimes where this strategy is active.
+        The main loop skips strategies in incompatible regimes (server-side check,
+        not just a prompt hint). None means "runs in any regime".
     """
 
     name: str = ""
     description: str = ""
+    compatible_regimes: set[str] | None = None  # None = all regimes OK
 
     @abstractmethod
-    def build_prompt(self, indicators: dict, symbol: str) -> str:
+    def build_prompt(self, indicators: dict, symbol: str,
+                     regime: dict | None = None) -> str:
         """Return the strategy-specific prompt fragment for Kimi K2.6."""
         ...
 
@@ -38,6 +52,16 @@ class BaseStrategy(ABC):
     def parse_response(self, response: dict, indicators: dict) -> SignalResult:
         """Parse the LLM JSON response into a SignalResult."""
         ...
+
+    def check_entry(self, indicators: dict) -> SignalResult:
+        """
+        Deterministic entry check — pure function of indicators, no LLM.
+
+        Default implementation returns "none". Override in subclasses to
+        encode the strategy's mechanical rules. Used by the backtester and
+        as a server-side gate in live trading.
+        """
+        return SignalResult(direction="none", confidence=0.0)
 
     def fallback_signal(self) -> SignalResult:
         """Return a default "none" signal (used on parse failure)."""

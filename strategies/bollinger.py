@@ -10,37 +10,79 @@ from strategies.base import BaseStrategy, SignalResult, coerce_confidence
 class BollingerStrategy(BaseStrategy):
     name = "bollinger"
     description = "Bollinger Band mean reversion with RSI confirmation"
+    compatible_regimes = {"chop", "mixed"}  # mean-reversion — disabled in strong trends
 
-    def build_prompt(self, indicators: dict, symbol: str) -> str:
+    def build_prompt(self, indicators: dict, symbol: str,
+                     regime: dict | None = None) -> str:
         i15 = indicators.get("15m", {})
+        i1h = indicators.get("1h", {})
+        i4h = indicators.get("4h", {})
+        regime_block = ""
+        if regime:
+            regime_block = (
+                f"\nMARKET REGIME: {regime.get('regime', 'unknown')} "
+                f"(BTC dominance: {regime.get('btc_dominance', 'n/a')})\n"
+            )
         return f"""
-STRATEGY: Bollinger Band Mean Reversion
-Asset: {symbol}
+STRATEGY: Bollinger Band Mean Reversion (Cascading Multi-Timeframe)
+Asset: {symbol}{regime_block}
+DECISION TREE — require alignment from top down:
 
-**LONG CONDITIONS (ALL required):**
-1. Candle wick touches or crosses below BB lower band
-2. RSI(14) < 35
-3. Candle closes back above the lower band (rejection wick preferred)
-4. BB width > 1% of price (avoids flat consolidation)
+STEP 1 — 4H BIAS (the macro tide):
+  4H price vs EMA50: {i4h.get('price_vs_ema50', 'n/a')} (price={i4h.get('price')}, ema50={i4h.get('ema50')})
+  4H RSI: {i4h.get('rsi')}
+  → Mean reversion works best in RANGING markets. If 4H is in a strong trend
+    (price far from EMA50, RSI > 65 or < 35), the fade is dangerous — SKIP.
 
-**SHORT CONDITIONS (ALL required):**
-1. Candle wick touches or crosses above BB upper band
-2. RSI(14) > 65
-3. Candle closes back below the upper band
-4. BB width > 1% of price
+STEP 2 — 1H STRUCTURE (range or trend?):
+  1H price vs EMA50: {i1h.get('price_vs_ema50')} (price={i1h.get('price')}, ema50={i1h.get('ema50')})
+  1H EMA20: {i1h.get('ema20')}
+  → If 1H price is near EMA50 (within 1 ATR), market is ranging — OK to fade.
+  → If 1H price is far from EMA50, trend is strong — SKIP the fade.
 
-Target: Middle band (BB basis / 20 EMA).
-Stop: Beyond the wick that touched the band.
+STEP 3 — 15m TRIGGER (the band touch):
+  15m Price: {i15.get('price')} (high: {i15.get('high')}, low: {i15.get('low')})
+  15m BB: lower={i15.get('bb_lower')} middle={i15.get('bb_middle')} upper={i15.get('bb_upper')}
+  15m RSI: {i15.get('rsi')}
+  BB width: {i15.get('bb_width')}
+  → LONG trigger: wick touches/crosses below BB lower AND RSI < 35 AND BB width > 1%
+  → SHORT trigger: wick touches/crosses above BB upper AND RSI > 65 AND BB width > 1%
+  Target: Middle band (BB basis / 20 EMA).
+  Stop: Beyond the wick that touched the band.
 
-CURRENT DATA:
-15m Price: {i15.get('price')} (high: {i15.get('high')}, low: {i15.get('low')})
-15m BB: lower={i15.get('bb_lower')} middle={i15.get('bb_middle')} upper={i15.get('bb_upper')}
-15m RSI: {i15.get('rsi')}
-BB width: {i15.get('bb_width')}
+ALL THREE STEPS MUST ALIGN. A 15m band touch in a strong 4H trend is a SKIP.
 15m ATR: {i15.get('atr')}
 
 Return ONLY valid JSON with keys: direction, confidence, reasoning, entry_price, invalidation.
 """
+
+    def check_entry(self, indicators: dict) -> SignalResult:
+        """Deterministic Bollinger mean-reversion check (no LLM)."""
+        i15 = indicators.get("15m", {})
+        price = i15.get("price")
+        low = i15.get("low")
+        high = i15.get("high")
+        bb_lower = i15.get("bb_lower")
+        bb_upper = i15.get("bb_upper")
+        bb_width = i15.get("bb_width")
+        rsi = i15.get("rsi")
+
+        if bb_width is not None and bb_width <= 0.01:
+            return SignalResult(direction="none", confidence=0.0, entry_price=price)
+
+        if low is not None and bb_lower is not None and low <= bb_lower and rsi is not None and rsi < 35:
+            return SignalResult(
+                direction="long", confidence=0.7,
+                reasoning="BB long: wick touched lower band, RSI<35, width>1%",
+                entry_price=price,
+            )
+        if high is not None and bb_upper is not None and high >= bb_upper and rsi is not None and rsi > 65:
+            return SignalResult(
+                direction="short", confidence=0.7,
+                reasoning="BB short: wick touched upper band, RSI>65, width>1%",
+                entry_price=price,
+            )
+        return SignalResult(direction="none", confidence=0.0, entry_price=price)
 
     def parse_response(self, response: dict, indicators: dict) -> SignalResult:
         i15 = indicators.get("15m", {})

@@ -47,7 +47,9 @@ class RegimeEngine:
             }
         except Exception as exc:
             logger.warning(f"Regime context failed: {exc}")
-            return {"btc_dominance": 0.5, "regime": "mixed", "context_tickers": []}
+            # "unknown" (not "mixed") so the regime gate fails open instead of
+            # silently benching strategies whenever the fetch hiccups.
+            return {"btc_dominance": 0.5, "regime": "unknown", "context_tickers": []}
 
     @staticmethod
     def _analyze_trend(candles: list[CbCandle]) -> dict:

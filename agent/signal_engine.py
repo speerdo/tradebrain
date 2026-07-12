@@ -42,22 +42,59 @@ class SignalEngine:
         self._available = bool(self.cfg.openrouter_api_key)
         if not self._available:
             logger.warning("SignalEngine: OPENROUTER_API_KEY missing — signal evaluation disabled")
+        self._memory_engine = None  # wired in by main.py for C5 memory loop
+
+    def set_memory_engine(self, memory_engine) -> None:
+        """Wire in the MemoryEngine for similar-setup retrieval (C5)."""
+        self._memory_engine = memory_engine
+
+    async def _get_similar_setups(self, symbol: str, strategy: str,
+                                  indicators: dict, regime: dict | None) -> str:
+        """
+        Retrieve the 3 most similar past setups from semantic memory (C5).
+        Returns a prompt fragment string (empty if none found).
+        """
+        if self._memory_engine is None:
+            return ""
+        i15 = indicators.get("15m", {})
+        regime_label = regime.get("regime", "unknown") if regime else "unknown"
+        query = (
+            f"{strategy} {symbol} regime={regime_label} "
+            f"rsi={i15.get('rsi')} macd_hist={i15.get('macd_hist')} "
+            f"price_vs_ema50={indicators.get('1h', {}).get('price_vs_ema50')}"
+        )
+        try:
+            memories = await self._memory_engine.search_memories(query, limit=3, importance_threshold=0.5)
+        except Exception as exc:
+            logger.warning(f"Memory retrieval failed: {exc}")
+            return ""
+        if not memories:
+            return ""
+        lines = ["\nSIMILAR PAST SETUPS (from memory):"]
+        for m in memories:
+            content = m.get("content", "")[:150]
+            lines.append(f"- {content}")
+        return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------------
     # Signal evaluation
     # ------------------------------------------------------------------
 
     async def evaluate(self, symbol: str, strategy: BaseStrategy,
-                       indicators: dict) -> SignalResult:
+                       indicators: dict, regime: dict | None = None,
+                       extra_context: str = "") -> SignalResult:
         """
         Run full LLM evaluation for one symbol + strategy.
         Falls back to "none" signal if key missing / API error / parse failure.
+
+        `extra_context` is a pre-formatted string (derivatives + sentiment blocks)
+        appended to the prompt after the strategy fragment.
         """
         llm_response = {"direction": "none", "confidence": 0.0}
 
         if self._available:
             try:
-                llm_response = await self._call_llm(symbol, strategy, indicators)
+                llm_response = await self._call_llm(symbol, strategy, indicators, regime, extra_context)
             except Exception as exc:
                 logger.error(f"LLM call failed for {symbol}: {exc}")
                 llm_response = {"direction": "none", "confidence": 0.0}
@@ -74,9 +111,19 @@ class SignalEngine:
         return signal
 
     async def _call_llm(self, symbol: str, strategy: BaseStrategy,
-                        indicators: dict) -> dict:
+                        indicators: dict, regime: dict | None = None,
+                        extra_context: str = "") -> dict:
         """POST to OpenRouter and parse the JSON response."""
-        prompt = strategy.build_prompt(indicators, symbol)
+        prompt = strategy.build_prompt(indicators, symbol, regime=regime)
+        # C5: append similar past setups from memory
+        similar = await self._get_similar_setups(
+            symbol, strategy.name, indicators, regime
+        )
+        if similar:
+            prompt = prompt + similar
+        # C3/C4: append derivatives + sentiment context
+        if extra_context:
+            prompt = prompt + extra_context
 
         headers = {
             "Authorization": f"Bearer {self.cfg.openrouter_api_key}",
@@ -85,7 +132,7 @@ class SignalEngine:
         }
 
         payload = {
-            "model": "moonshotai/kimi-k2.6",
+            "model": self.cfg.signal_model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -163,6 +210,7 @@ class SignalEngine:
                 "macd_hist_15m": i15.get("macd_hist"),
                 "atr_15m": i15.get("atr"),
                 "price": i15.get("price"),
+                "model": self.cfg.signal_model if self._available else None,
             })
         except Exception as exc:
             logger.warning(f"Failed to log signal: {exc}")

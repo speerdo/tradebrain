@@ -82,10 +82,14 @@ def bbands(series: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFram
 # Main compute function
 # =====================================================================
 
-def compute_indicators(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
+def _compute_indicator_df(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Compute all indicators for signal evaluation.
-    Returns structured dict matching BLUEPRINT.md Section 5.2.
+    Compute all indicator columns on the full 15m + 1h frames.
+
+    Returns the enriched (df_15m, df_1h) DataFrames. Indicators are computed
+    on the full series — callers that need zero-look-ahead must slice AFTER
+    computation and only inspect rows up to their "current" bar (see
+    `compute_indicators_at`).
     """
     _validate_ohlcv(df_15m)
     _validate_ohlcv(df_1h)
@@ -129,12 +133,95 @@ def compute_indicators(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
     df_1h["ema50"] = ema(df_1h["close"], length=50)
     df_1h["rsi"] = rsi(df_1h["close"], length=14)
 
-    # --- Extract last-bar values ---
+    return df_15m, df_1h
+
+
+def aggregate_candles(df: pd.DataFrame, factor: int) -> pd.DataFrame:
+    """
+    Aggregate a lower-timeframe candle DataFrame into a higher timeframe
+    by grouping `factor` consecutive bars.
+
+    E.g. aggregate_candles(df_2h, 2) → 4h candles.
+    Input df must have columns: time, open, high, low, close, volume.
+    """
+    if df.empty or factor <= 1:
+        return df
+    df = df.sort_values("time").reset_index(drop=True)
+    df["grp"] = np.arange(len(df)) // factor
+    agg = df.groupby("grp").agg({
+        "time": "first",
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).reset_index(drop=True)
+    return agg
+
+
+def compute_4h_indicators(df_4h: pd.DataFrame) -> dict:
+    """
+    Compute 4h trend indicators for the cascading multi-timeframe prompt (C2).
+    Returns the last-bar dict with price, ema20, ema50, rsi, price_vs_ema50.
+    """
+    if df_4h is None or df_4h.empty:
+        return {}
+    _validate_ohlcv(df_4h)
+    df = df_4h.copy()
+    df["ema20"] = ema(df["close"], length=20)
+    df["ema50"] = ema(df["close"], length=50)
+    df["rsi"] = rsi(df["close"], length=14)
+    df["atr"] = atr(df["high"], df["low"], df["close"], length=14)
+    last = df.iloc[-1]
+    def _safe(val):
+        return None if pd.isna(val) else float(val)
+    return {
+        "price": _safe(last["close"]),
+        "ema20": _safe(last["ema20"]),
+        "ema50": _safe(last["ema50"]),
+        "price_vs_ema50": "above" if last["close"] > last["ema50"] else "below",
+        "rsi": _safe(last["rsi"]),
+        "atr": _safe(last["atr"]),
+    }
+
+
+def compute_indicators(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
+    """
+    Compute all indicators for signal evaluation.
+    Returns structured dict matching BLUEPRINT.md Section 5.2.
+
+    Convenience wrapper: computes indicators on the full frames and returns
+    the dict at the latest bar. For backtesting, use `compute_indicators_at`.
+    """
+    df_15m_enriched, df_1h_enriched = _compute_indicator_df(df_15m, df_1h)
+    return compute_indicators_at(
+        df_15m_enriched, df_1h_enriched,
+        len(df_15m_enriched) - 1, len(df_1h_enriched) - 1,
+    )
+
+
+def compute_indicators_at(df_15m_full: pd.DataFrame, df_1h_full: pd.DataFrame,
+                          i_15m: int, i_1h: int) -> dict:
+    """
+    Zero-look-ahead indicator extraction.
+
+    Given the FULL pre-computed indicator DataFrames and a "current" index,
+    return the indicator dict as of the close of that bar — only using rows
+    up to and including that index. This is the backtester's contract:
+    no future data leaks into a decision.
+
+    `i_15m` is the index into df_15m_full of the "current" 15m bar.
+    `i_1h` is the index of the most recent CLOSED 1h bar as of that 15m bar.
+    """
+    df_15m = df_15m_full.iloc[: i_15m + 1]
+    df_1h = df_1h_full.iloc[: i_1h + 1]
+    if df_15m.empty or df_1h.empty:
+        return {}
+
     last = df_15m.iloc[-1]
-    prev = df_15m.iloc[-2]
+    prev = df_15m.iloc[-2] if len(df_15m) > 1 else last
     last_1h = df_1h.iloc[-1]
 
-    # Safety: if any indicator is NaN, return None for that field
     def _safe(val):
         return None if pd.isna(val) else float(val)
 
