@@ -220,4 +220,23 @@ def _build_config() -> Config:
         default_max_watchlist=_int("DEFAULT_MAX_WATCHLIST", 5),
         burt_active_hours_start=_int("BURT_ACTIVE_HOURS_START", 6),
         burt_active_hours_end=_int("BURT_ACTIVE_HOURS_END", 22),
+        # Run-plane roles (MODELS.md §6, §7). These MUST be listed here — Config
+        # is built from explicit kwargs, so a field that is not passed silently
+        # keeps its class default and every *_MODEL / *_PROVIDER in .env is
+        # ignored no matter what .env.example documents.
+        signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),
+        critic_model=_env("CRITIC_MODEL"),
+        burt_model=_env("BURT_MODEL"),
+        embedding_model=_env("EMBEDDING_MODEL", "openai/text-embedding-3-small"),
+        consolidation_model=_env("CONSOLIDATION_MODEL"),
+        signal_provider=_env("SIGNAL_PROVIDER", "openrouter"),
+        critic_provider=_env("CRITIC_PROVIDER", "openrouter"),
+        burt_provider=_env("BURT_PROVIDER", "openrouter"),
+        embedding_provider=_env("EMBEDDING_PROVIDER", "openrouter"),
+        consolidation_provider=_env("CONSOLIDATION_PROVIDER", "openrouter"),
+        signal_timeout=_float("SIGNAL_TIMEOUT", 30.0),
+        critic_timeout=_float("CRITIC_TIMEOUT", 90.0),
+        burt_timeout=_float("BURT_TIMEOUT", 45.0),
+        embedding_timeout=_float("EMBEDDING_TIMEOUT", 15.0),
+        consolidation_timeout=_float("CONSOLIDATION_TIMEOUT", 90.0),
     )

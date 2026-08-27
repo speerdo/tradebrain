@@ -202,6 +202,20 @@ that can serve the bot without a metered key or a ToS problem:
 Local inference is slow on consumer hardware, so it belongs on the offline/fallback path —
 never on the hot signal path where a 300s loop is waiting.
 
+> **Ollama Cloud, as actually configured (2026-08-27).** `:cloud` tags are *not* local —
+> the daemon proxies them to ollama.com using the signed-in account, so they bill the
+> Ollama Pro subscription even though the base URL is `localhost` and no API key is set.
+> `validate_run_plane_config` cannot detect that from the URL, so it emits a **warning**
+> (not a block) for a `:cloud` model on the signal role. That is the right call: at
+> post-G1 volume (~50 calls/day ≈ 19k tokens/day) this is comfortably sustainable, and a
+> bounded test run is exactly what the exception is for. Revisit before running
+> 300s × N symbols continuously.
+>
+> **Cloud tags expire.** The three tags on this machine had all been retired server-side —
+> `glm-5` (2026-07-15), `kimi-k2.5` and `minimax-m2.5` (2026-07-31) — and returned
+> `410 Gone`, not a clean error the agent would surface as anything but an LLM failure.
+> Re-`ollama pull` and re-test after any gap in use.
+
 ### 6.3 ⚠️ Do not use GLM-5.3-**Flash** as the confirmer
 
 The cheap-tokens argument points at GLM-5.3-Flash ($0.15/$0.50 per 1M, halved through
@@ -296,6 +310,7 @@ of which model wrote it.
 | 2026-08-27 | Run | Added §2 build/run separation and the seat-subscription prohibition. | Volume arithmetic: bot needs 1,440–4,320 calls/day; OpenCode Go allows ~528 Kimi K3 calls/day, Claude Pro ~45 per 5h window. |
 | 2026-08-27 | Run | **Reversed the GLM-5.3-Flash signal-model recommendation → GLM-5.3 non-reasoning.** | Flash TTFT is ~42s vs GLM-5.3's 1.60s. The earlier pick was made on token price before §6.1's volume math showed cost stops binding post-G1; latency is the real constraint for a trigger-confirmer. |
 | 2026-08-27 | Run | Flagged `kimi-k2.6` (current `signal_model` + `burt_model` pin) as **deprecated**. | Provider-scheduled withdrawal risk; migration is now maintenance, not optimization. |
+| 2026-08-27 | Run | **Test-run routing: signal/critic/burt/consolidation → `glm-5.2:cloud` via local Ollama daemon** (`http://localhost:11434/v1`, no API key — the daemon proxies with the signed-in account). Embeddings stay on OpenRouter. | Measured on this machine: **3.2–3.7s round trip, 3/3 valid JSON**, and a full `SignalEngine` call logged `model='glm-5.2:cloud'`, `parse_failed=False`. Comfortably inside the 30s signal timeout, and it retires the deprecated K2.6 pin for the signal path. |
 | 2026-08-27 | Both | **Kimi K3 must be used with Ollama Cloud** everywhere it appears (build-plane escalation, run-plane critic, consolidation). | Provider routing standardization: Kimi K3 is served via Ollama Cloud; OpenCode Go reference removed. |
 
 ---

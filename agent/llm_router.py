@@ -12,6 +12,7 @@ Providers (all OpenAI-compatible — base-URL + key swap, not a client rewrite):
     openrouter | zai | moonshot | ollama
 """
 
+import os
 from dataclasses import dataclass
 
 from loguru import logger
@@ -117,13 +118,29 @@ def validate_run_plane_config(cfg) -> list[str]:
                     "The run plane must use pay-per-token keys (MODELS.md §2)."
                 )
 
+        allow_cloud = os.getenv("RUN_PLANE_ALLOW_OLLAMA_CLOUD", "").strip().lower() \
+            in ("1", "true", "yes", "on")
         if role in HIGH_VOLUME_ROLES and r.provider == "ollama" and r.api_key \
-                and "ollama.com" in r.base_url:
+                and "ollama.com" in r.base_url and not allow_cloud:
             errors.append(
                 f"Role '{role}' routes to Ollama Cloud with an account key — a seat "
                 "subscription cannot sustain the loop volume (MODELS.md §2). Use a "
                 "pay-per-token provider, local Ollama (no key), or set "
                 "RUN_PLANE_ALLOW_OLLAMA_CLOUD=1 to acknowledge."
+            )
+
+        # The local daemon proxies `:cloud` tags to ollama.com using the
+        # signed-in account, so a localhost base_url with no API key still
+        # spends the Ollama subscription — the error above cannot see that.
+        # Warn rather than block: at post-G1 volume (~50 calls/day) this is
+        # comfortably sustainable, and it is the right setup for a test run.
+        if role in HIGH_VOLUME_ROLES and r.provider == "ollama" \
+                and r.model.endswith(":cloud"):
+            logger.warning(
+                f"Role '{role}' uses the Ollama cloud model '{r.model}'. Even via "
+                "localhost this bills the Ollama subscription, not a metered key. "
+                "Fine for a test run and for post-G1 volume; revisit before "
+                "running 300s x N symbols continuously (MODELS.md §2)."
             )
     return errors
 
