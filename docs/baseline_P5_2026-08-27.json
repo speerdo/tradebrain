@@ -1,0 +1,58 @@
+{
+  "captured_at": "2026-08-27T21:02:02.993527+00:00",
+  "window_days": 120,
+  "cost_per_call_usd_assumed": 0.0014,
+  "signal_model": "moonshotai/kimi-k2.6",
+  "caveats": [
+    "parse_failed column was added 2026-08-27 (P1); rows before that date have parse_failed=FALSE by default, NOT measured \u2014 parse-failure baselines only become meaningful once the agent runs post-P1.",
+    "est_spend_usd uses an assumed blended cost-per-call, not provider data."
+  ],
+  "averages": {
+    "llm_calls_per_day": 855.5,
+    "symbols_evaluated_per_day": 4.2,
+    "parse_failure_rate_pct": 0.0,
+    "est_spend_per_day_usd": 1.2
+  },
+  "daily": [
+    {
+      "date": "2026-05-08",
+      "llm_calls": 172,
+      "symbols_evaluated": 5,
+      "signals_logged": 172,
+      "parse_failures": 0,
+      "acted_on": 0,
+      "model_populated_pct": 0.0,
+      "est_spend_usd": 0.24
+    },
+    {
+      "date": "2026-05-09",
+      "llm_calls": 821,
+      "symbols_evaluated": 4,
+      "signals_logged": 821,
+      "parse_failures": 0,
+      "acted_on": 0,
+      "model_populated_pct": 0.0,
+      "est_spend_usd": 1.15
+    },
+    {
+      "date": "2026-05-10",
+      "llm_calls": 1219,
+      "symbols_evaluated": 4,
+      "signals_logged": 1219,
+      "parse_failures": 0,
+      "acted_on": 0,
+      "model_populated_pct": 0.0,
+      "est_spend_usd": 1.71
+    },
+    {
+      "date": "2026-05-11",
+      "llm_calls": 1210,
+      "symbols_evaluated": 4,
+      "signals_logged": 1210,
+      "parse_failures": 0,
+      "acted_on": 0,
+      "model_populated_pct": 0.0,
+      "est_spend_usd": 1.69
+    }
+  ]
+}
