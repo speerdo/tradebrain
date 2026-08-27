@@ -65,6 +65,10 @@ class Config(BaseModel):
     strategy: str = Field(default="rsi_macd")
     signal_interval: int = Field(default=300)
     max_watchlist: int = Field(default=5)
+    # How often the screener re-ranks the whole perp universe. Costs ~4s of
+    # Coinbase calls and ZERO LLM tokens, so it is cheap to run often — unlike
+    # signal_interval, where every tick spends one LLM call per symbol.
+    screener_interval_h: float = Field(default=1.0)
     min_confidence: float = Field(default=0.65)
     atr_multiplier: float = Field(default=1.5)
     take_profit_rr: float = Field(default=2.0)
@@ -233,6 +237,7 @@ def _build_config() -> Config:
         default_strategy=_env("DEFAULT_STRATEGY", "rsi_macd"),
         default_signal_interval=_int("DEFAULT_SIGNAL_INTERVAL", 300),
         default_max_watchlist=_int("DEFAULT_MAX_WATCHLIST", 5),
+        screener_interval_h=_float("SCREENER_INTERVAL_H", 1.0),
         burt_active_hours_start=_int("BURT_ACTIVE_HOURS_START", 6),
         burt_active_hours_end=_int("BURT_ACTIVE_HOURS_END", 22),
         # Run-plane roles (MODELS.md §6, §7). These MUST be listed here — Config
