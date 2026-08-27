@@ -24,7 +24,7 @@ async def test():
             "X-Title": "TradeBrain",
         }
         payload = {
-            "model": "moonshotai/kimi-k2.6",
+            "model": get_config().signal_model,
             "messages": [
                 {"role": "system", "content": "You are TradeBrain, an expert crypto futures trading signal evaluator. Analyze live technical indicator data and determine whether a trading signal meets the defined strategy criteria. Rules: Only signal 'long' or 'short' when ALL required conditions are clearly met. When in doubt, return 'none'. Be concise in reasoning. ALWAYS return valid JSON only, no markdown, no preamble. Never recommend a trade without clear technical justification."},
                 {"role": "user", "content": prompt},

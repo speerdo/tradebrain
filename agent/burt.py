@@ -18,12 +18,12 @@ from loguru import logger
 import config
 from agent.database import get_db
 from agent.executor import Executor
+from agent import llm_router
 from agent.indicator_engine import compute_indicators
 from agent.risk_manager import RiskManager
 from agent.screener import Screener
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-BURT_MODEL = "moonshotai/kimi-k2.6"
 
 # Tools whose execution mutates trading state and require user confirmation.
 DESTRUCTIVE_TOOLS = {"close_position"}
@@ -391,27 +391,27 @@ class Burt:
         messages.extend(history_msgs)
         messages.append({"role": "user", "content": user_message})
 
-        headers = {
-            "Authorization": f"Bearer {self.cfg.openrouter_api_key}",
-            "HTTP-Referer": "https://github.com/tradebrain",
-            "X-Title": "TradeBrain-Burt",
-        }
+        route = llm_router.route(self.cfg, "burt")
 
         # Tool-call loop: up to 4 rounds. Each round, the model can either return
         # final text (we stop) or call one or more tools (we execute, append
         # results, loop again).
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=route.timeout) as client:
             for _ in range(4):
                 payload = {
-                    "model": BURT_MODEL,
+                    "model": route.model,
                     "messages": messages,
                     "tools": TOOLS,
                     "temperature": 0.6,
                     "max_tokens": 800,
-                    "reasoning": {"exclude": True},
                 }
+                if route.provider == "openrouter":
+                    payload["reasoning"] = {"exclude": True}
                 try:
-                    resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+                    resp = await client.post(
+                        f"{route.base_url}/chat/completions",
+                        headers=route.headers, json=payload,
+                    )
                     resp.raise_for_status()
                     data = resp.json()
                 except httpx.HTTPStatusError as exc:

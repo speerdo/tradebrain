@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS signals (
     macd_hist_15m   FLOAT,
     atr_15m         FLOAT,
     price           FLOAT,
-    model           TEXT
+    model           TEXT,
+    parse_failed    BOOLEAN DEFAULT FALSE,
+    raw_response_snippet TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trades (
@@ -145,7 +147,16 @@ INSERT INTO agent_config (key, value) VALUES
     ('atr_multiplier', '1.5'),
     ('take_profit_rr', '2.0'),
     ('stop_loss_method', 'atr'),
-    ('signal_model', 'moonshotai/kimi-k2.6')
+    ('signal_model', 'moonshotai/kimi-k2.6'),
+    ('critic_model', ''),
+    ('burt_model', ''),
+    ('embedding_model', 'openai/text-embedding-3-small'),
+    ('consolidation_model', ''),
+    ('signal_provider', 'openrouter'),
+    ('critic_provider', 'openrouter'),
+    ('burt_provider', 'openrouter'),
+    ('embedding_provider', 'openrouter'),
+    ('consolidation_provider', 'openrouter')
 ON CONFLICT (key) DO NOTHING;
 
 -- =========================================================================
@@ -209,6 +220,14 @@ CREATE TABLE IF NOT EXISTS news_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_news_created ON news_cache(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_news_symbol ON news_cache(symbol, created_at DESC);
+
+-- =========================================================================
+-- MIGRATIONS (idempotent — safe to re-run against existing databases)
+-- =========================================================================
+
+-- P1: signal parse-failure instrumentation
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS parse_failed BOOLEAN DEFAULT FALSE;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS raw_response_snippet TEXT;
 """
 
 PGVECTOR_INDEX_SQL = """

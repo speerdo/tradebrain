@@ -116,6 +116,16 @@ class Notifier:
         )
         await self._send_webhook(notif)
 
+    async def notify_alert(self, title: str, message: str,
+                           color: str = "warning") -> None:
+        """Generic operational alert (reconciliation divergence, missed stop...)."""
+        notif = Notification(
+            title=f"⚠️ {title}",
+            description=message,
+            color=self.COLORS.get(color, self.COLORS["warning"]),
+        )
+        await self._send_webhook(notif)
+
     # ------------------------------------------------------------------
     # Webhook sender
     # ------------------------------------------------------------------

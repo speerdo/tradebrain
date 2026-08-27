@@ -184,7 +184,7 @@ class CoinbaseClient:
         return perps
 
     async def hydrate_product_details(self, product_id: str) -> dict:
-        """Fetch per-product detail for funding, OI, etc."""
+        """Fetch per-product detail for funding, OI, contract size, etc."""
         data = await self._request(
             "GET",
             f"/api/v3/brokerage/market/products/{product_id}",
@@ -193,10 +193,18 @@ class CoinbaseClient:
         pdets = fp.get("perpetual_details", {})
         funding = fp.get("funding_rate", "") or pdets.get("funding_rate", "")
         oi = fp.get("open_interest", "") or pdets.get("open_interest", "")
+        contract_size = fp.get("contract_size", "")
+        # `price` is the product's current mark. PositionMonitor reads
+        # "mark_price" from this dict on every tick — without it, every
+        # position marks at its entry price and NO stop, take-profit, or
+        # trailing ratchet can ever fire.
+        mark = data.get("price", "")
         return {
             "funding_rate": float(funding) if funding else None,
             "open_interest": float(oi) if oi else None,
             "max_leverage": None,
+            "contract_size": float(contract_size) if contract_size else None,
+            "mark_price": float(mark) if mark else None,
         }
 
     async def hydrate_all(self, products: list[CbFutureProduct]) -> list[CbFutureProduct]:
@@ -308,6 +316,70 @@ class CoinbaseClient:
         """List open CFM positions."""
         data = await self._request("GET", "/api/v3/brokerage/cfm/positions")
         return data.get("positions", [])
+
+    # ------------------------------------------------------------------
+    # Orders (CFM futures)
+    # ------------------------------------------------------------------
+
+    async def place_futures_market_order(
+        self, product_id: str, side: str, contracts: int,
+        leverage: int = 1, margin_type: str = "ISOLATED",
+    ) -> dict:
+        """
+        Market entry for a CFM future. `contracts` is whole contracts
+        (base_size is contract count for futures, not base currency).
+        """
+        payload = {
+            "client_order_id": secrets.token_hex(16),
+            "product_id": product_id,
+            "side": side,
+            "order_configuration": {
+                "market_market_ioc": {"base_size": str(contracts)},
+            },
+            "leverage": str(leverage),
+            "margin_type": margin_type,
+        }
+        return await self.place_order(payload)
+
+    async def place_futures_stop_order(
+        self, product_id: str, side: str, contracts: int,
+        stop_price: float, limit_price: float, stop_direction: str,
+    ) -> dict:
+        """
+        Exchange-native stop-limit (crash protection for live positions).
+        `stop_direction` is STOP_DIRECTION_STOP_DOWN (long SL) or
+        STOP_DIRECTION_STOP_UP (short SL).
+        """
+        payload = {
+            "client_order_id": secrets.token_hex(16),
+            "product_id": product_id,
+            "side": side,
+            "order_configuration": {
+                "stop_limit_stop_limit_gtc": {
+                    "base_size": str(contracts),
+                    "limit_price": f"{limit_price:.8f}".rstrip("0").rstrip("."),
+                    "stop_price": f"{stop_price:.8f}".rstrip("0").rstrip("."),
+                    "stop_direction": stop_direction,
+                },
+            },
+        }
+        return await self.place_order(payload)
+
+    async def close_futures_position(self, product_id: str, size: str | None = None) -> dict:
+        """
+        Close a CFM position via the dedicated close-position endpoint
+        (marketable, reduce-only). `size` = contracts for partial close;
+        omit for full close.
+        """
+        payload: dict = {
+            "client_order_id": secrets.token_hex(16),
+            "product_id": product_id,
+        }
+        if size is not None:
+            payload["size"] = size
+        return await self._request(
+            "POST", "/api/v3/brokerage/orders/close_position", json=payload
+        )
 
     # ------------------------------------------------------------------
     # Orders

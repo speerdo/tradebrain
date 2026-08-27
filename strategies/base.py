@@ -15,6 +15,8 @@ class SignalResult:
     reasoning: str = ""       # max 150 chars
     entry_price: float | None = None
     invalidation: str = ""    # what would cancel the setup
+    parse_failed: bool = False  # LLM output was malformed — "none" is NOT a real no-signal
+    raw_response_snippet: str = ""  # first 200 chars of unparseable / errored LLM output
 
 
 class BaseStrategy(ABC):
@@ -53,15 +55,16 @@ class BaseStrategy(ABC):
         """Parse the LLM JSON response into a SignalResult."""
         ...
 
+    @abstractmethod
     def check_entry(self, indicators: dict) -> SignalResult:
         """
         Deterministic entry check — pure function of indicators, no LLM.
 
-        Default implementation returns "none". Override in subclasses to
-        encode the strategy's mechanical rules. Used by the backtester and
-        as a server-side gate in live trading.
+        Mandatory: M7/G1 gates the live LLM call on this method and the
+        backtester replays it bar-by-bar. A strategy without an override is
+        silently gated to zero trades forever — fail at import instead.
         """
-        return SignalResult(direction="none", confidence=0.0)
+        ...
 
     def fallback_signal(self) -> SignalResult:
         """Return a default "none" signal (used on parse failure)."""

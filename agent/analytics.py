@@ -150,7 +150,75 @@ async def compute_analytics(starting_balance: float = 100_000.0) -> dict:
         "by_symbol": by_symbol,
         "by_hour": by_hour,
         "by_confidence": by_confidence,
+        "by_model": await analytics_by_model(),
     }
+
+
+async def analytics_by_model() -> dict:
+    """
+    Performance sliced by the `model` column (MODELS.md §5/§7) — the A/B
+    dimension for model swaps. Trades join to signals via symbol+time is
+    lossy, so this reports per-model signal volume and parse-failure rate;
+    PnL attribution per model lands when trades carry a model column.
+    """
+    db = await get_db()
+    rows = await db.fetch(
+        """
+        SELECT model,
+               COUNT(*) AS signals,
+               COUNT(*) FILTER (WHERE acted_on) AS acted,
+               COUNT(*) FILTER (WHERE parse_failed) AS parse_failures
+        FROM signals
+        WHERE model IS NOT NULL
+          AND created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY model
+        ORDER BY signals DESC
+        """
+    )
+    out = {}
+    for r in rows:
+        signals = int(r["signals"]) or 1
+        out[r["model"]] = {
+            "signals": int(r["signals"]),
+            "acted_on": int(r["acted"]),
+            "parse_failures": int(r["parse_failures"]),
+            "parse_failure_rate_pct": round(int(r["parse_failures"]) / signals * 100, 2),
+        }
+    return out
+
+
+async def parse_failure_rate(days: int = 7) -> dict:
+    """
+    Parse-failure rate per model over the lookback window (P1).
+
+    Distinguishes malformed LLM output from genuine no-signals — this is the
+    metric that must be measured (>=200 calls) before/after any model swap
+    (MODELS.md §6.3).
+    """
+    db = await get_db()
+    rows = await db.fetch(
+        """
+        SELECT model,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE parse_failed) AS failed
+        FROM signals
+        WHERE created_at >= NOW() - ($1 || ' days')::interval
+          AND model IS NOT NULL
+        GROUP BY model
+        ORDER BY total DESC
+        """,
+        str(days),
+    )
+    out = {}
+    for r in rows:
+        total = int(r["total"])
+        failed = int(r["failed"])
+        out[r["model"]] = {
+            "calls": total,
+            "parse_failures": failed,
+            "failure_rate_pct": round(failed / total * 100, 2) if total else 0.0,
+        }
+    return out
 
 
 async def weekly_self_review() -> str:

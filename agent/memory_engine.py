@@ -165,7 +165,7 @@ Return JSON:
                 response = await self._signal_engine.chat([
                     {"role": "system", "content": "You are Burt. Return ONLY valid JSON."},
                     {"role": "user", "content": prompt},
-                ])
+                ], role="consolidation")
                 # Parse JSON from response
                 import json
                 import re

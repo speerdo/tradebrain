@@ -38,6 +38,14 @@ class Config(BaseModel):
     moondev_api_key: str = Field(default="")
 
     # ------------------------------------------------------------------
+    # Run-plane LLM providers (MODELS.md §2, §7) — pay-per-token keys only
+    # ------------------------------------------------------------------
+    zai_api_key: str = Field(default="")
+    moonshot_api_key: str = Field(default="")
+    ollama_api_key: str = Field(default="")
+    ollama_base_url: str = Field(default="https://ollama.com/v1")  # local: http://localhost:11434/v1
+
+    # ------------------------------------------------------------------
     # Trading defaults (all overridable in UI)
     # ------------------------------------------------------------------
     paper_trading: bool = Field(default=True)
@@ -63,6 +71,24 @@ class Config(BaseModel):
     fixed_stop_pct: float = Field(default=0.02)
     stop_loss_method: str = Field(default="atr")
     signal_model: str = Field(default="moonshotai/kimi-k2.6")
+
+    # ------------------------------------------------------------------
+    # Run-plane model roles (MODELS.md §6, §7) — hot-reloadable
+    # ------------------------------------------------------------------
+    critic_model: str = Field(default="")                  # "" → signal_model
+    burt_model: str = Field(default="")                    # "" → signal_model
+    embedding_model: str = Field(default="openai/text-embedding-3-small")
+    consolidation_model: str = Field(default="")           # "" → signal_model
+    signal_provider: str = Field(default="openrouter")     # openrouter|zai|moonshot|ollama
+    critic_provider: str = Field(default="openrouter")
+    burt_provider: str = Field(default="openrouter")
+    embedding_provider: str = Field(default="openrouter")
+    consolidation_provider: str = Field(default="openrouter")
+    signal_timeout: float = Field(default=30.0)            # seconds, per-role
+    critic_timeout: float = Field(default=90.0)            # critic is relaxed (M11)
+    burt_timeout: float = Field(default=45.0)
+    embedding_timeout: float = Field(default=15.0)
+    consolidation_timeout: float = Field(default=90.0)
 
     # ------------------------------------------------------------------
     # Validators
@@ -181,6 +207,10 @@ def _build_config() -> Config:
         discord_user_id=_env("DISCORD_USER_ID"),
         discord_webhook_url=_env("DISCORD_WEBHOOK_URL"),
         moondev_api_key=_env("MOONDEV_API_KEY"),
+        zai_api_key=_env("ZAI_API_KEY"),
+        moonshot_api_key=_env("MOONSHOT_API_KEY"),
+        ollama_api_key=_env("OLLAMA_API_KEY"),
+        ollama_base_url=_env("OLLAMA_BASE_URL", "https://ollama.com/v1"),
         paper_trading=_bool("PAPER_TRADING", True),
         default_leverage=_int("DEFAULT_LEVERAGE", 3),
         default_risk_per_trade=_float("DEFAULT_RISK_PER_TRADE", 0.01),

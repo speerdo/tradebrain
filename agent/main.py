@@ -19,6 +19,7 @@ import uvicorn
 from loguru import logger
 
 import config
+from agent import llm_router
 from agent.api import app, set_agent_state
 from agent.burt import Burt
 from agent.coinbase_client import CoinbaseClient
@@ -57,6 +58,9 @@ class TradeBrainAgent:
         self.notifier = Notifier(self.burt)
         self.monitor.set_notifier(self.notifier)
         self.executor.set_notifier(self.notifier)
+        # P0: positions closed on the exchange between monitor ticks never
+        # reach PositionMonitor._handle_exit — the executor books them itself.
+        self.executor.set_risk_manager(self.risk)
         self.watchlist: list[str] = []
         self._shutdown = asyncio.Event()
         self._api_task = None
@@ -74,6 +78,15 @@ class TradeBrainAgent:
         self.db = await get_db()
         logger.info("✅ Database connected")
 
+        # P3: enforce MODELS.md §2 — the run plane pays per token. A seat
+        # subscription on the run plane degrades silently within hours.
+        routing_errors = llm_router.validate_run_plane_config(self.cfg)
+        if routing_errors:
+            for err in routing_errors:
+                logger.error(f"Run-plane config violation: {err}")
+            raise RuntimeError("Run-plane LLM routing violates MODELS.md §2 — refusing to start")
+        llm_router.log_routing_table(self.cfg)
+
         # Wire Burt after DB is ready
         self.burt.db = self.db
         self._burt_task = asyncio.create_task(self.burt.start())
@@ -83,6 +96,12 @@ class TradeBrainAgent:
             logger.warning("⚠️  Coinbase auth failed — check COINBASE_API_KEY + SECRET")
 
         await self.cb.verify_futures_provisioned()
+
+        # P0: live positions are reconciled from the exchange before anything
+        # evaluates — portfolio caps and re-entry suppression must see reality.
+        if not self.cfg.paper_trading:
+            live = await self.executor.reconcile_live_positions()
+            logger.info(f"Live reconciliation: {len(live)} open position(s) on exchange")
 
         logger.info("Running initial screener...")
         self.watchlist = await self.screener.run()

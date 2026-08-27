@@ -95,6 +95,11 @@ class PositionMonitor:
             await asyncio.sleep(self.CHECK_INTERVAL)
 
     async def _check(self) -> None:
+        # Live mode: reconcile from the exchange every tick — it is the
+        # source of truth for what is actually open.
+        if not self.executor.cfg.paper_trading:
+            await self.executor.reconcile_live_positions()
+
         positions = self.executor.get_open_positions()
         if not positions:
             return
@@ -112,8 +117,28 @@ class PositionMonitor:
             if not price:
                 continue
 
+            # Adopted positions (reconciled from the exchange, not opened by
+            # this bot) carry stop_loss=0/take_profit=0 as a deliberate
+            # "unknown levels" marker. Running them through _evaluate would
+            # compare price against 0 and instantly report a stop-out (shorts)
+            # or take-profit (longs), market-closing a position we did not
+            # open and booking a full-notional fake PnL. Report only.
+            if pos.stop_loss <= 0 and pos.take_profit <= 0:
+                logger.info(
+                    f"👁️  {pos.display_name} adopted/unmanaged — monitoring only "
+                    f"@ {price:.2f} (no stop or TP known; close it manually or "
+                    f"via Burt)"
+                )
+                continue
+
             # --- Exit management (B2): update stops before evaluating ---
+            prev_stop = pos.stop_loss
             await self._manage_exits(pos, price)
+            # Live: keep the exchange-native crash stop aligned with the stop
+            # the bot just ratcheted, or the protection left on the exchange
+            # is the stale (wider) level if the bot dies.
+            if not pos.is_paper and pos.stop_loss != prev_stop:
+                await self.executor.sync_live_stop(pos)
 
             snap = self._evaluate(pos, price)
             if snap.status != "open":
@@ -150,11 +175,18 @@ class PositionMonitor:
         # Partial take-profit: bank PARTIAL_TP_PCT of the position at +1R.
         # Combined with the breakeven move below, the remainder becomes a
         # risk-free runner.
+        # Runs in BOTH modes. Gating this on `pos.is_paper` made paper and live
+        # take structurally different exits, which silently invalidates every
+        # paper result as evidence about live behaviour — the same divergence
+        # class as the P0 position-tracking bug. If partials are a bad idea,
+        # ENABLE_PARTIAL_TP turns them off for both modes; never just one.
         if (ENABLE_PARTIAL_TP and not meta.get("partial_done")
-                and r_mult >= PARTIAL_TP_AT_R and pos.is_paper):
+                and r_mult >= PARTIAL_TP_AT_R):
             result = await self.executor.reduce_position(
                 pos.product_id, price, PARTIAL_TP_PCT
             )
+            # Marked done either way: a live position too small to split (1
+            # contract) must not be retried on every 30s tick.
             meta["partial_done"] = True
             if result.success:
                 logger.info(
