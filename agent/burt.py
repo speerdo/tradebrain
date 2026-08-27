@@ -751,38 +751,113 @@ class Burt:
     # Notifications (called by main agent)
     # ------------------------------------------------------------------
 
-    async def notify_trade_opened(self, symbol: str, order: dict, signal: Any) -> None:
-        """Send trade notification in Burt's voice."""
-        if self._client is None:
-            return
-        channel = self._client.get_channel(int(self.cfg.discord_channel_id))
-        if channel:
-            await channel.send(f"Opened {signal.direction} {symbol}. Let's see how this goes.")
+    @staticmethod
+    def _px(v: float) -> str:
+        """Format a price across BTC ($61,240) and cheap alts ($0.00001234).
 
-    async def notify_trade_closed(self, trade: Any) -> None:
-        """Send close notification in Burt's voice."""
-        if self._client is None:
-            return
-        channel = self._client.get_channel(int(self.cfg.discord_channel_id))
-        if channel:
-            pnl_text = f"P&L: ${trade.pnl_usdc:+.2f}" if hasattr(trade, 'pnl_usdc') else ""
-            await channel.send(f"Closed {trade.symbol}. {pnl_text}")
+        A plain `:,.4g` renders 61240 as `6.124e+04`, which is unreadable in a
+        trade alert.
+        """
+        if not v:
+            return "0"
+        a = abs(v)
+        if a >= 1000:
+            return f"{v:,.0f}"
+        if a >= 1:
+            return f"{v:,.2f}"
+        if a >= 0.01:
+            return f"{v:.4f}"
+        return f"{v:.8f}".rstrip("0")
 
-    async def notify_circuit_breaker(self) -> None:
-        """Send circuit breaker alert in Burt's voice."""
-        if self._client is None:
-            return
-        channel = self._client.get_channel(int(self.cfg.discord_channel_id))
-        if channel:
-            await channel.send("Circuit breaker triggered. I'm done for the day.")
+    def _mention(self) -> str:
+        """@mention the owner so alerts actually push to their phone."""
+        uid = (self.cfg.discord_user_id or "").strip()
+        return f"<@{uid}> " if uid else ""
 
-    async def morning_brief(self) -> None:
-        """Send morning brief."""
+    async def _post(self, text: str, mention: bool = False) -> bool:
+        """
+        Post to the Burt channel.
+
+        Returns True if it landed. get_channel() reads the local cache and
+        returns None whenever the bot has not cached the channel yet (early
+        startup, or a permissions problem) — the old code silently did nothing
+        in that case, so a missed notification looked identical to no event.
+        Falls back to an API fetch and logs loudly on failure.
+        """
         if self._client is None:
-            return
-        channel = self._client.get_channel(int(self.cfg.discord_channel_id))
-        if channel:
-            await channel.send("Morning. Screener's running. Will report back if anything looks good.")
+            logger.warning(f"Discord client not ready — dropped: {text[:80]}")
+            return False
+        cid = (self.cfg.discord_channel_id or "").strip()
+        if not cid:
+            logger.warning("DISCORD_CHANNEL_ID not set — cannot post notifications")
+            return False
+        try:
+            channel = self._client.get_channel(int(cid))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(cid))
+            await channel.send(f"{self._mention() if mention else ''}{text}")
+            return True
+        except Exception as exc:
+            logger.error(f"Discord post failed ({exc}) — dropped: {text[:120]}")
+            return False
+
+    async def notify_trade_opened(self, symbol: str, direction: str,
+                                  entry_price: float = 0.0, size_usdc: float = 0.0,
+                                  leverage: int = 0, stop_loss: float = 0.0,
+                                  take_profit: float = 0.0,
+                                  mode: str = "PAPER") -> bool:
+        """Trade opened — pings the owner."""
+        arrow = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+        risk = abs(entry_price - stop_loss) / entry_price * size_usdc if entry_price and stop_loss else 0.0
+        return await self._post(
+            f"**{arrow} {symbol}** ({mode})\n"
+            f"Entry `{self._px(entry_price)}` · Size `${size_usdc:,.2f}` @ `{leverage}x`\n"
+            f"Stop `{self._px(stop_loss)}` · Target `{self._px(take_profit)}` · Risk `${risk:,.2f}`",
+            mention=True,
+        )
+
+    async def notify_trade_closed(self, symbol: str, direction: str = "",
+                                  entry_price: float = 0.0, exit_price: float = 0.0,
+                                  pnl_usdc: float = 0.0) -> bool:
+        """Trade closed — pings the owner."""
+        win = pnl_usdc >= 0
+        pct = ((exit_price - entry_price) / entry_price * 100) if entry_price else 0.0
+        if direction == "short":
+            pct = -pct
+        return await self._post(
+            f"**{'🟢 CLOSED +' if win else '🔴 CLOSED '}{symbol}**\n"
+            f"`{self._px(entry_price)}` → `{self._px(exit_price)}` ({pct:+.2f}%) · "
+            f"P&L **${pnl_usdc:+,.2f}**",
+            mention=True,
+        )
+
+    async def notify_circuit_breaker(self, daily_loss: float = 0.0,
+                                     limit: float = 0.0) -> bool:
+        detail = (f" Daily loss ${daily_loss:,.2f} hit the ${limit:,.2f} limit."
+                  if limit else "")
+        return await self._post(
+            f"🚨 **CIRCUIT BREAKER**.{detail} I'm done for the day — "
+            "no new entries until midnight UTC.",
+            mention=True,
+        )
+
+    async def notify_alert(self, title: str, message: str) -> bool:
+        """
+        Operational alert (reconciliation divergence, missing exchange stop,
+        externally-closed position). These had no Burt path at all and fell
+        through to a webhook that is not configured, so they were dropped.
+        """
+        return await self._post(f"⚠️ **{title}**\n{message}", mention=True)
+
+    async def notify_daily_summary(self, wins: int, losses: int, pnl: float) -> bool:
+        return await self._post(
+            f"📊 **Daily summary** — {wins}W / {losses}L · P&L **${pnl:+,.2f}**"
+        )
+
+    async def morning_brief(self) -> bool:
+        return await self._post(
+            "Morning. Screener's running. Will report back if anything looks good."
+        )
 
     # ------------------------------------------------------------------
     # Active hours check

@@ -230,6 +230,10 @@ class RiskManager:
     # Sync from DB / UI
     # ------------------------------------------------------------------
 
+    def set_notifier(self, notifier: Any) -> None:
+        """Wire notifications so the circuit breaker actually reaches Discord."""
+        self._notifier = notifier
+
     def set_client(self, cb: Any) -> None:
         """Wire the exchange client so live mode can read the real balance."""
         self._cb = cb
@@ -427,12 +431,29 @@ class RiskManager:
         limit = self.state.balance_usdc * self.state.daily_loss_limit_pct
         if self.state.daily_loss_usdc >= limit:
             self.state.circuit_breaker_active = True
+            # The breaker halts all trading — it is the single most important
+            # thing to be told about, and it had no notification path at all.
+            self._notify_circuit_breaker(limit)
             logger.error(
                 f"╔══════════════════════════════════════╗\n"
                 f"║   CIRCUIT BREAKER TRIGGERED          ║\n"
                 f"║   Daily loss: ${self.state.daily_loss_usdc:.2f} >= ${limit:.2f}   ║\n"
                 f"╚══════════════════════════════════════╝"
             )
+
+    def _notify_circuit_breaker(self, limit: float) -> None:
+        """Fire-and-forget Discord alert. apply_loss is sync and is called from
+        inside the running loop, so schedule rather than await."""
+        notifier = getattr(self, "_notifier", None)
+        if notifier is None:
+            return
+        import asyncio
+        try:
+            asyncio.get_running_loop().create_task(
+                notifier.notify_circuit_breaker(self.state.daily_loss_usdc, limit)
+            )
+        except RuntimeError:
+            logger.warning("Circuit breaker alert not sent — no running event loop")
 
     def reset_circuit_breaker(self) -> None:
         self.state.daily_loss_usdc = 0.0

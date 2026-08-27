@@ -62,6 +62,7 @@ class TradeBrainAgent:
         # reach PositionMonitor._handle_exit — the executor books them itself.
         self.executor.set_risk_manager(self.risk)
         self.risk.set_client(self.cb)
+        self.risk.set_notifier(self.notifier)
         self.watchlist: list[str] = []
         self._shutdown = asyncio.Event()
         self._api_task = None
@@ -276,6 +277,7 @@ class TradeBrainAgent:
 
             result = await self.executor.enter_position(
                 symbol=product_id,
+                display_name=self.screener.display_names.get(product_id, product_id),
                 direction=sig.direction,
                 entry_price=entry,
                 stop_loss=sl,

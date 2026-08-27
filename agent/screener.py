@@ -49,6 +49,8 @@ class Screener:
         self.cb = cb
         self.cfg = config.get_config()
         self._derivatives = DerivativesContext()
+        # product_id -> friendly name ("BTC PERP"), for logs and Discord alerts
+        self.display_names: dict[str, str] = {}
 
     async def run(self, max_watchlist: int | None = None) -> list[str]:
         max_watchlist = max_watchlist or self.cfg.max_watchlist
@@ -108,6 +110,7 @@ class Screener:
         scores.sort(key=lambda s: s.total_score, reverse=True)
         top = scores[:max_watchlist]
         result = [s.product_id for s in top]
+        self.display_names.update({s.product_id: s.display_name for s in scores})
 
         await self._log(top)
         logger.info(f"Screener complete. Top {len(result)}: {[s.display_name for s in top]}")
