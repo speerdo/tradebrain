@@ -163,7 +163,7 @@ confirmer that takes 40s to answer has already missed the bar it was asked about
 
 | Role | Config key | Current pin | Candidate | Why |
 |---|---|---|---|---|
-| **Signal evaluation** (Tier 1) | `signal_model` | `moonshotai/kimi-k2.6` ⚠️ **deprecated** | **GLM-5.3 (non-reasoning)** | TTFT **1.60s**, 62.6 t/s, ~$0.90/1M blended. Fastest credible option, and cheap enough that post-G1 volume is ~$4.50/mo. **Not** GLM-5.3-Flash — see §6.3. |
+| **Signal evaluation** (Tier 1) | `signal_model` | **`z-ai/glm-5.3-flash`** via OpenRouter, `effort: low` | — | Measured 2.2–5.1s and ~148 output tokens on the real prompt; **$7.08/mo at today's 1,440 calls/day, $0.25/mo post-G1** (§6.4). Retires the deprecated K2.6 pin. |
 | **Risk critic** (planned, `ROADMAP_V2.md` H1) | `critic_model` | *unset* | **Kimi K3 (via Ollama Cloud)** | A handful of calls/day, so $3/$15 and a 7.2s TTFT are both fine. Must be a **different family** than `signal_model`: a second opinion from the same model is not a second opinion. Signal = GLM ⇒ critic = Kimi (or Claude). Route Kimi K3 via Ollama Cloud. |
 | **Burt chat** | `burt_model` | `moonshotai/kimi-k2.6` (hardcoded, `agent/burt.py:26`) | **GLM-5.2** | Tool-calling + personality. Latency matters (Discord). |
 | **Embeddings** | `embedding_model` | `openai/text-embedding-3-small` (hardcoded, `signal_engine.py:230`) | Keep, or **local via Ollama** (§6.2) | 1536-dim. **Changing this invalidates the entire `memories` pgvector table** — see §8. |
@@ -216,37 +216,56 @@ never on the hot signal path where a 300s loop is waiting.
 > `410 Gone`, not a clean error the agent would surface as anything but an LLM failure.
 > Re-`ollama pull` and re-test after any gap in use.
 
-### 6.3 ⚠️ Do not use GLM-5.3-**Flash** as the confirmer
+### 6.3 GLM-5.3-Flash — viable, but only with `reasoning_effort: low`
 
-The cheap-tokens argument points at GLM-5.3-Flash ($0.15/$0.50 per 1M, halved through
-2026-09-09). Reject it on latency. Artificial Analysis measures:
+> **This section reverses itself twice; read the dates.** The original entry said
+> "do not use Flash," based on Artificial Analysis' 41.94s figure. That number is
+> **time to first *answer* token** — it measures the reasoning phase, not the model.
+> Flash is a reasoning model that cannot disable thinking (`{"enabled": false}` →
+> HTTP 400 *"Reasoning is mandatory for this endpoint"*), but effort **can** be
+> dialled down, and that changes the verdict entirely.
 
-| Model | TTFT | Output speed | Blended price |
+Measured 2026-08-27 on this repo's real `rsi_macd` prompt (599 input tokens),
+z-ai/glm-5.3-flash via OpenRouter:
+
+| Setting | Latency | Output tokens | Of which reasoning | Valid JSON |
+|---|---|---|---|---|
+| default effort | 17–20s | ~1,038 | ~800 (77%) | 2/2 |
+| **`reasoning: {effort: "low"}`** | **2.2–5.1s** | **~148** | ~50 | 5/5 |
+
+**~7x fewer output tokens and ~4x faster, with no loss of output validity.** Reasoning
+tokens bill as *output*, so effort is simultaneously the dominant cost lever and the
+dominant latency lever. It is wired as a per-role config key (`signal_reasoning_effort`,
+default `low`; critic defaults to `high` because a veto should think).
+
+### 6.4 What 24/7 actually costs
+
+Per-call basis: **599 input + ~148 output** at `effort: low`. OpenRouter list price is
+$0.15/M in, $0.50/M out; a launch promo halves it through 2026-09-09.
+
+| Volume | Promo | List | $20 lasts (list) |
 |---|---|---|---|
-| **GLM-5.3 (max)** | **1.60s** | 62.6 t/s (non-reasoning) | ~$0.90/1M |
-| Kimi K3 (max, via Ollama Cloud) | 7.20s | 35.3 t/s | ~$2.31/1M |
-| **GLM-5.3-Flash** | **~42s** ❌ | 49.4 t/s, *"notably slow and very verbose"* | ~$0.15/$0.50 |
+| **1,440/day** (today: 300s × 5) | $3.54/mo | **$7.08/mo** | ~2.8 months |
+| **4,320/day** (15-symbol watchlist) | $10.60/mo | $21.20/mo | ~28 days |
+| **~50/day** (post-G1 trigger gate) | $0.12/mo | **$0.25/mo** | **~6.7 years** |
 
-The Flash variant is **26× slower to first token than the full model** despite the name —
-it front-loads reasoning. Two consequences for us:
+Three things follow:
 
-1. `agent/signal_engine.py:41` sets `httpx.Timeout(30.0)`. Flash would time out on most
-   calls and fail closed to `direction: "none"` — silent, total signal loss that looks
-   exactly like a quiet market.
-2. Even with a raised timeout it's wrong for Tier 1. A trigger-confirmer answering 42s
-   after a breakout fired is answering about a bar that has already closed.
+1. **$20 comfortably covers 24/7 at current volume** — roughly three months, six at promo
+   pricing. Flash suits the always-on budget.
+2. **Without `effort: low` it would be $26/mo** at the same volume — $20 gone in 23 days.
+   The dial matters more than the model choice.
+3. **G1 still dominates everything.** Going from 1,440 to ~50 calls/day is a **28x** saving;
+   every model-price optimisation available is worth a fraction of that. Widening the
+   watchlist to 15 *before* G1 is the one move that breaks the budget.
 
-Per §6.1, its token discount is worth ~$3/mo at post-G1 volume. That is not worth buying
-a 42-second decision latency. **Use GLM-5.3 non-reasoning.**
-
-Whichever model lands, still do this before promoting it:
-1. Confirm the signal-engine timeout comfortably exceeds observed p95 TTFT **and** stays
-   well under `signal_interval`.
-2. Cap `max_tokens` (currently 3000) and tighten the prompt — we need a small JSON object,
-   and on reasoning models those tokens are billed as output.
-3. Measure JSON parse-failure rate across ≥200 calls. GLM supports JSON mode but **not
-   schema enforcement**, so malformed output is a live risk that `_extract_json` would be
-   quietly absorbing into `direction: "none"`.
+Whichever model is pinned, before promoting it:
+1. Confirm the role timeout comfortably exceeds observed p95 latency **and** stays well
+   under `signal_interval`. Flash at default effort (17–20s) would have been dangerous
+   against the old 30s timeout; at `low` it is 2–5s. `signal_timeout` is now 60s.
+2. Keep `max_tokens` generous (3000). It is a ceiling, not a target — reasoning models
+   truncate mid-thought and return nothing usable if it is set too tight.
+3. Measure JSON parse-failure rate across ≥200 calls via the P1 `parse_failed` column.
 
 ### Known stale references (fix on next touch)
 

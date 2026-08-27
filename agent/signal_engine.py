@@ -158,6 +158,9 @@ class SignalEngine:
             # We parse JSON manually from content instead
         }
 
+        if route.reasoning_effort:
+            payload["reasoning"] = {"effort": route.reasoning_effort}
+
         resp = await self._client.post(
             f"{route.base_url}/chat/completions",
             headers=route.headers, json=payload, timeout=route.timeout,

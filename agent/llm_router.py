@@ -49,6 +49,8 @@ class Route:
     headers: dict
     model: str
     timeout: float
+    reasoning_effort: str = ""
+
 
 
 def resolve_model(cfg, role: str) -> str:
@@ -59,6 +61,16 @@ def resolve_model(cfg, role: str) -> str:
 
 def resolve_provider(cfg, role: str) -> str:
     return (getattr(cfg, f"{role}_provider", "") or "openrouter").lower()
+
+
+def resolve_reasoning_effort(cfg, role: str) -> str:
+    """Reasoning effort for a role; "" means don't send the field.
+
+    Only meaningful on providers that expose it (OpenRouter / z.ai). On
+    GLM-5.3-Flash it is the dominant cost and latency lever — reasoning tokens
+    bill as output, and the default effort spends ~7x more of them.
+    """
+    return (getattr(cfg, f"{role}_reasoning_effort", "") or "").strip().lower()
 
 
 def resolve_timeout(cfg, role: str) -> float:
@@ -91,6 +103,12 @@ def route(cfg, role: str) -> Route:
         headers=headers,
         model=resolve_model(cfg, role),
         timeout=resolve_timeout(cfg, role),
+        # Ollama's OpenAI surface does not accept the `reasoning` field, so it
+        # is only carried for providers that do.
+        reasoning_effort=(
+            resolve_reasoning_effort(cfg, role)
+            if provider in ("openrouter", "zai") else ""
+        ),
     )
 
 

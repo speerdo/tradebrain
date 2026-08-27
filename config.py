@@ -84,6 +84,16 @@ class Config(BaseModel):
     burt_provider: str = Field(default="openrouter")
     embedding_provider: str = Field(default="openrouter")
     consolidation_provider: str = Field(default="openrouter")
+    # Reasoning effort per role ("" = don't send the field at all).
+    # On GLM-5.3-Flash this is the single biggest cost+latency lever: measured
+    # 2026-08-27, "low" cut a real signal call from 17-20s/1038 output tokens
+    # to 4-5s/148 — ~7x cheaper and ~4x faster, still valid JSON. Reasoning
+    # cannot be disabled entirely on that endpoint (HTTP 400).
+    signal_reasoning_effort: str = Field(default="low")
+    critic_reasoning_effort: str = Field(default="high")    # critic should think
+    burt_reasoning_effort: str = Field(default="low")
+    embedding_reasoning_effort: str = Field(default="")
+    consolidation_reasoning_effort: str = Field(default="")
     signal_timeout: float = Field(default=30.0)            # seconds, per-role
     critic_timeout: float = Field(default=90.0)            # critic is relaxed (M11)
     burt_timeout: float = Field(default=45.0)
@@ -234,6 +244,11 @@ def _build_config() -> Config:
         burt_provider=_env("BURT_PROVIDER", "openrouter"),
         embedding_provider=_env("EMBEDDING_PROVIDER", "openrouter"),
         consolidation_provider=_env("CONSOLIDATION_PROVIDER", "openrouter"),
+        signal_reasoning_effort=_env("SIGNAL_REASONING_EFFORT", "low"),
+        critic_reasoning_effort=_env("CRITIC_REASONING_EFFORT", "high"),
+        burt_reasoning_effort=_env("BURT_REASONING_EFFORT", "low"),
+        embedding_reasoning_effort=_env("EMBEDDING_REASONING_EFFORT"),
+        consolidation_reasoning_effort=_env("CONSOLIDATION_REASONING_EFFORT"),
         signal_timeout=_float("SIGNAL_TIMEOUT", 30.0),
         critic_timeout=_float("CRITIC_TIMEOUT", 90.0),
         burt_timeout=_float("BURT_TIMEOUT", 45.0),
