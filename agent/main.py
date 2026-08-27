@@ -61,6 +61,7 @@ class TradeBrainAgent:
         # P0: positions closed on the exchange between monitor ticks never
         # reach PositionMonitor._handle_exit — the executor books them itself.
         self.executor.set_risk_manager(self.risk)
+        self.risk.set_client(self.cb)
         self.watchlist: list[str] = []
         self._shutdown = asyncio.Event()
         self._api_task = None
@@ -102,6 +103,18 @@ class TradeBrainAgent:
         if not self.cfg.paper_trading:
             live = await self.executor.reconcile_live_positions()
             logger.info(f"Live reconciliation: {len(live)} open position(s) on exchange")
+
+        # Balance before anything reads it. risk.sync() would fix this on the
+        # first loop tick, but the API/UI and Burt come up before that and would
+        # report the 100k placeholder as the account size.
+        await self.db.sync_config()
+        await self.risk.sync()
+        logger.info(
+            f"Account: ${self.risk.state.balance_usdc:,.2f} "
+            f"({'PAPER' if self.cfg.paper_trading else 'LIVE'}) | "
+            f"risk/trade {self.risk.state.risk_per_trade_pct:.1%} | "
+            f"daily stop ${self.risk.state.balance_usdc * self.risk.state.daily_loss_limit_pct:,.2f}"
+        )
 
         logger.info("Running initial screener...")
         self.watchlist = await self.screener.run()

@@ -230,9 +230,47 @@ class RiskManager:
     # Sync from DB / UI
     # ------------------------------------------------------------------
 
+    def set_client(self, cb: Any) -> None:
+        """Wire the exchange client so live mode can read the real balance."""
+        self._cb = cb
+
+    async def _sync_balance(self) -> None:
+        """
+        Keep balance_usdc real.
+
+        Every position size, the total-risk cap, the drawdown scale, and the
+        circuit-breaker threshold are percentages of this number. It used to be
+        hardcoded at 100_000 with a comment claiming it was "updated in a real
+        run" — nothing updated it, so a $200 paper account sized trades for a
+        $100k one and put the daily loss limit at $5,000.
+        """
+        if self.cfg.paper_trading:
+            bal = float(self.cfg.paper_balance or 0)
+            if bal > 0 and bal != self.state.balance_usdc:
+                logger.info(f"Paper balance set to ${bal:,.2f}")
+                self.state.balance_usdc = bal
+            return
+        cb = getattr(self, "_cb", None)
+        if cb is None:
+            return
+        try:
+            summary = await cb.get_futures_balance_summary()
+            bs = summary.get("balance_summary", summary) or {}
+            for key in ("cfm_usd_balance", "total_usd_balance", "futures_buying_power"):
+                raw = bs.get(key)
+                val = float(raw.get("value")) if isinstance(raw, dict) else float(raw or 0)
+                if val > 0:
+                    if abs(val - self.state.balance_usdc) > 0.01:
+                        logger.info(f"Live balance synced from exchange ({key}): ${val:,.2f}")
+                    self.state.balance_usdc = val
+                    return
+        except Exception as exc:
+            logger.warning(f"Balance sync failed — keeping ${self.state.balance_usdc:,.2f}: {exc}")
+
     async def sync(self) -> None:
         """Called at top of each signal loop iteration."""
         from agent.database import get_db
+        await self._sync_balance()
         # DB key → RiskParams field. Several params have a `_pct` suffix on the
         # state object that the DB key omits — map them explicitly so the UI
         # actually moves the right knob.
@@ -245,6 +283,7 @@ class RiskManager:
             "fixed_stop_pct": "fixed_stop_pct",
             "stop_loss_method": "stop_loss_method",
             "min_confidence": "min_confidence",
+            "paper_balance": "balance_usdc",
         }
         try:
             db = await get_db()
@@ -268,7 +307,8 @@ class RiskManager:
         if key in ("leverage",):
             return int(val)
         if key in ("risk_per_trade", "daily_loss_limit", "atr_multiplier",
-                   "take_profit_rr", "min_confidence", "fixed_stop_pct"):
+                   "take_profit_rr", "min_confidence", "fixed_stop_pct",
+                   "paper_balance"):
             return float(val)
         return val
 

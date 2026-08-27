@@ -70,6 +70,11 @@ class Config(BaseModel):
     take_profit_rr: float = Field(default=2.0)
     fixed_stop_pct: float = Field(default=0.02)
     stop_loss_method: str = Field(default="atr")
+    # Paper-mode account size. RiskManager sizes every position and sets the
+    # circuit-breaker threshold off this, so it must reflect the budget you
+    # are actually simulating — the old hardcoded 100k made a "1% risk" trade
+    # $1,000 and put the daily loss limit at $5,000.
+    paper_balance: float = Field(default=200.0)
     signal_model: str = Field(default="moonshotai/kimi-k2.6")
 
     # ------------------------------------------------------------------
@@ -234,6 +239,7 @@ def _build_config() -> Config:
         # is built from explicit kwargs, so a field that is not passed silently
         # keeps its class default and every *_MODEL / *_PROVIDER in .env is
         # ignored no matter what .env.example documents.
+        paper_balance=_float("PAPER_BALANCE", 200.0),
         signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),
         critic_model=_env("CRITIC_MODEL"),
         burt_model=_env("BURT_MODEL"),
