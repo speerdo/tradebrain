@@ -34,7 +34,7 @@ DO NOT output anything before or after the JSON."""
     prompt = """BTC signal evaluation. RSI=68.8, MACD hist increasing, price below 1h EMA50. Strategy: RSI+MACD momentum with EMA50 filter."""
 
     payload = {
-        "model": "moonshotai/kimi-k2.6",
+        "model": get_config().signal_model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},

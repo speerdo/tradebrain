@@ -126,8 +126,9 @@ class Database:
         sql = """
             INSERT INTO signals (
                 symbol, direction, strategy, confidence, reasoning,
-                acted_on, skip_reason, rsi_15m, macd_hist_15m, atr_15m, price, model
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                acted_on, skip_reason, rsi_15m, macd_hist_15m, atr_15m, price, model,
+                parse_failed, raw_response_snippet
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id
         """
         vals = (
@@ -143,6 +144,8 @@ class Database:
             signal.get("atr_15m"),
             signal.get("price"),
             signal.get("model"),
+            signal.get("parse_failed", False),
+            signal.get("raw_response_snippet"),
         )
         sid = await self.fetchval(sql, *vals)
         logger.debug(f"Logged signal {sid} for {signal['symbol']}")

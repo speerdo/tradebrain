@@ -19,6 +19,7 @@ import uvicorn
 from loguru import logger
 
 import config
+from agent import llm_router
 from agent.api import app, set_agent_state
 from agent.burt import Burt
 from agent.coinbase_client import CoinbaseClient
@@ -57,6 +58,11 @@ class TradeBrainAgent:
         self.notifier = Notifier(self.burt)
         self.monitor.set_notifier(self.notifier)
         self.executor.set_notifier(self.notifier)
+        # P0: positions closed on the exchange between monitor ticks never
+        # reach PositionMonitor._handle_exit — the executor books them itself.
+        self.executor.set_risk_manager(self.risk)
+        self.risk.set_client(self.cb)
+        self.risk.set_notifier(self.notifier)
         self.watchlist: list[str] = []
         self._shutdown = asyncio.Event()
         self._api_task = None
@@ -74,6 +80,15 @@ class TradeBrainAgent:
         self.db = await get_db()
         logger.info("✅ Database connected")
 
+        # P3: enforce MODELS.md §2 — the run plane pays per token. A seat
+        # subscription on the run plane degrades silently within hours.
+        routing_errors = llm_router.validate_run_plane_config(self.cfg)
+        if routing_errors:
+            for err in routing_errors:
+                logger.error(f"Run-plane config violation: {err}")
+            raise RuntimeError("Run-plane LLM routing violates MODELS.md §2 — refusing to start")
+        llm_router.log_routing_table(self.cfg)
+
         # Wire Burt after DB is ready
         self.burt.db = self.db
         self._burt_task = asyncio.create_task(self.burt.start())
@@ -83,6 +98,24 @@ class TradeBrainAgent:
             logger.warning("⚠️  Coinbase auth failed — check COINBASE_API_KEY + SECRET")
 
         await self.cb.verify_futures_provisioned()
+
+        # P0: live positions are reconciled from the exchange before anything
+        # evaluates — portfolio caps and re-entry suppression must see reality.
+        if not self.cfg.paper_trading:
+            live = await self.executor.reconcile_live_positions()
+            logger.info(f"Live reconciliation: {len(live)} open position(s) on exchange")
+
+        # Balance before anything reads it. risk.sync() would fix this on the
+        # first loop tick, but the API/UI and Burt come up before that and would
+        # report the 100k placeholder as the account size.
+        await self.db.sync_config()
+        await self.risk.sync()
+        logger.info(
+            f"Account: ${self.risk.state.balance_usdc:,.2f} "
+            f"({'PAPER' if self.cfg.paper_trading else 'LIVE'}) | "
+            f"risk/trade {self.risk.state.risk_per_trade_pct:.1%} | "
+            f"daily stop ${self.risk.state.balance_usdc * self.risk.state.daily_loss_limit_pct:,.2f}"
+        )
 
         logger.info("Running initial screener...")
         self.watchlist = await self.screener.run()
@@ -122,7 +155,8 @@ class TradeBrainAgent:
                 # Read hot-reload values fresh each iteration so UI/Burt edits
                 # take effect on the next tick instead of requiring a restart.
                 interval = self.cfg.signal_interval
-                screener_interval = max(1, 4 * 3600 // interval)
+                screener_hours = float(getattr(self.cfg, "screener_interval_h", 4.0) or 4.0)
+                screener_interval = max(1, int(screener_hours * 3600 // interval))
 
                 screener_counter += 1
                 if screener_counter >= screener_interval:
@@ -243,6 +277,7 @@ class TradeBrainAgent:
 
             result = await self.executor.enter_position(
                 symbol=product_id,
+                display_name=self.screener.display_names.get(product_id, product_id),
                 direction=sig.direction,
                 entry_price=entry,
                 stop_loss=sl,

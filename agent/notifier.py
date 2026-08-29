@@ -49,10 +49,15 @@ class Notifier:
                                    leverage: int, stop_loss: float,
                                    take_profit: float) -> None:
         """Notify that a trade was opened."""
-        if self.burt:
-            await self.burt.notify_trade_opened(symbol, {}, type("Signal", (), {
-                "direction": direction,
-            })())
+        # Burt first; fall through to the webhook if he could not post.
+        # The old code built a stub signal carrying ONLY `direction`, so entry
+        # price, size, leverage, stop and target were discarded and the Discord
+        # message was "Opened long <id>." with no numbers.
+        if self.burt and await self.burt.notify_trade_opened(
+            symbol, direction, entry_price, size_usdc, leverage,
+            stop_loss, take_profit,
+            "PAPER" if self.cfg.paper_trading else "LIVE",
+        ):
             return
 
         color = self.COLORS.get(direction, self.COLORS["info"])
@@ -73,10 +78,9 @@ class Notifier:
                                    entry_price: float, exit_price: float,
                                    pnl_usdc: float) -> None:
         """Notify that a trade was closed."""
-        if self.burt:
-            await self.burt.notify_trade_closed(type("Trade", (), {
-                "symbol": symbol, "pnl_usdc": pnl_usdc,
-            })())
+        if self.burt and await self.burt.notify_trade_closed(
+            symbol, direction, entry_price, exit_price, pnl_usdc
+        ):
             return
 
         is_profit = pnl_usdc >= 0
@@ -95,8 +99,7 @@ class Notifier:
 
     async def notify_circuit_breaker(self, daily_loss: float, limit: float) -> None:
         """Notify that circuit breaker triggered."""
-        if self.burt:
-            await self.burt.notify_circuit_breaker()
+        if self.burt and await self.burt.notify_circuit_breaker(daily_loss, limit):
             return
 
         notif = Notification(
@@ -109,10 +112,29 @@ class Notifier:
     async def notify_daily_summary(self, wins: int, losses: int,
                                     pnl: float) -> None:
         """Send end-of-day summary."""
+        if self.burt and await self.burt.notify_daily_summary(wins, losses, pnl):
+            return
         notif = Notification(
             title="📊 Daily Summary",
             description=f"{wins}W / {losses}L | P&L: ${pnl:+.2f}",
             color=self.COLORS["info"],
+        )
+        await self._send_webhook(notif)
+
+    async def notify_alert(self, title: str, message: str,
+                           color: str = "warning") -> None:
+        """Generic operational alert (reconciliation divergence, missed stop...).
+
+        These had no Burt branch and went straight to a webhook that is not
+        configured, so every P0 alert — adopted position, missing exchange
+        stop, externally-closed position — was silently discarded.
+        """
+        if self.burt and await self.burt.notify_alert(title, message):
+            return
+        notif = Notification(
+            title=f"⚠️ {title}",
+            description=message,
+            color=self.COLORS.get(color, self.COLORS["warning"]),
         )
         await self._send_webhook(notif)
 
@@ -122,6 +144,10 @@ class Notifier:
 
     async def _send_webhook(self, notif: Notification) -> None:
         if not self._has_webhook:
+            logger.warning(
+                f"No delivery path for notification (Burt unavailable and "
+                f"DISCORD_WEBHOOK_URL unset) — dropped: {notif.title}"
+            )
             return
         embed = {
             "title": notif.title,

@@ -38,6 +38,14 @@ class Config(BaseModel):
     moondev_api_key: str = Field(default="")
 
     # ------------------------------------------------------------------
+    # Run-plane LLM providers (MODELS.md §2, §7) — pay-per-token keys only
+    # ------------------------------------------------------------------
+    zai_api_key: str = Field(default="")
+    moonshot_api_key: str = Field(default="")
+    ollama_api_key: str = Field(default="")
+    ollama_base_url: str = Field(default="https://ollama.com/v1")  # local: http://localhost:11434/v1
+
+    # ------------------------------------------------------------------
     # Trading defaults (all overridable in UI)
     # ------------------------------------------------------------------
     paper_trading: bool = Field(default=True)
@@ -57,12 +65,49 @@ class Config(BaseModel):
     strategy: str = Field(default="rsi_macd")
     signal_interval: int = Field(default=300)
     max_watchlist: int = Field(default=5)
+    # How often the screener re-ranks the whole perp universe. Costs ~4s of
+    # Coinbase calls and ZERO LLM tokens, so it is cheap to run often — unlike
+    # signal_interval, where every tick spends one LLM call per symbol.
+    screener_interval_h: float = Field(default=1.0)
     min_confidence: float = Field(default=0.65)
     atr_multiplier: float = Field(default=1.5)
     take_profit_rr: float = Field(default=2.0)
     fixed_stop_pct: float = Field(default=0.02)
     stop_loss_method: str = Field(default="atr")
+    # Paper-mode account size. RiskManager sizes every position and sets the
+    # circuit-breaker threshold off this, so it must reflect the budget you
+    # are actually simulating — the old hardcoded 100k made a "1% risk" trade
+    # $1,000 and put the daily loss limit at $5,000.
+    paper_balance: float = Field(default=200.0)
     signal_model: str = Field(default="moonshotai/kimi-k2.6")
+
+    # ------------------------------------------------------------------
+    # Run-plane model roles (MODELS.md §6, §7) — hot-reloadable
+    # ------------------------------------------------------------------
+    critic_model: str = Field(default="")                  # "" → signal_model
+    burt_model: str = Field(default="")                    # "" → signal_model
+    embedding_model: str = Field(default="openai/text-embedding-3-small")
+    consolidation_model: str = Field(default="")           # "" → signal_model
+    signal_provider: str = Field(default="openrouter")     # openrouter|zai|moonshot|ollama
+    critic_provider: str = Field(default="openrouter")
+    burt_provider: str = Field(default="openrouter")
+    embedding_provider: str = Field(default="openrouter")
+    consolidation_provider: str = Field(default="openrouter")
+    # Reasoning effort per role ("" = don't send the field at all).
+    # On GLM-5.3-Flash this is the single biggest cost+latency lever: measured
+    # 2026-08-27, "low" cut a real signal call from 17-20s/1038 output tokens
+    # to 4-5s/148 — ~7x cheaper and ~4x faster, still valid JSON. Reasoning
+    # cannot be disabled entirely on that endpoint (HTTP 400).
+    signal_reasoning_effort: str = Field(default="low")
+    critic_reasoning_effort: str = Field(default="high")    # critic should think
+    burt_reasoning_effort: str = Field(default="low")
+    embedding_reasoning_effort: str = Field(default="")
+    consolidation_reasoning_effort: str = Field(default="")
+    signal_timeout: float = Field(default=30.0)            # seconds, per-role
+    critic_timeout: float = Field(default=90.0)            # critic is relaxed (M11)
+    burt_timeout: float = Field(default=45.0)
+    embedding_timeout: float = Field(default=15.0)
+    consolidation_timeout: float = Field(default=90.0)
 
     # ------------------------------------------------------------------
     # Validators
@@ -181,6 +226,10 @@ def _build_config() -> Config:
         discord_user_id=_env("DISCORD_USER_ID"),
         discord_webhook_url=_env("DISCORD_WEBHOOK_URL"),
         moondev_api_key=_env("MOONDEV_API_KEY"),
+        zai_api_key=_env("ZAI_API_KEY"),
+        moonshot_api_key=_env("MOONSHOT_API_KEY"),
+        ollama_api_key=_env("OLLAMA_API_KEY"),
+        ollama_base_url=_env("OLLAMA_BASE_URL", "https://ollama.com/v1"),
         paper_trading=_bool("PAPER_TRADING", True),
         default_leverage=_int("DEFAULT_LEVERAGE", 3),
         default_risk_per_trade=_float("DEFAULT_RISK_PER_TRADE", 0.01),
@@ -188,6 +237,32 @@ def _build_config() -> Config:
         default_strategy=_env("DEFAULT_STRATEGY", "rsi_macd"),
         default_signal_interval=_int("DEFAULT_SIGNAL_INTERVAL", 300),
         default_max_watchlist=_int("DEFAULT_MAX_WATCHLIST", 5),
+        screener_interval_h=_float("SCREENER_INTERVAL_H", 1.0),
         burt_active_hours_start=_int("BURT_ACTIVE_HOURS_START", 6),
         burt_active_hours_end=_int("BURT_ACTIVE_HOURS_END", 22),
+        # Run-plane roles (MODELS.md §6, §7). These MUST be listed here — Config
+        # is built from explicit kwargs, so a field that is not passed silently
+        # keeps its class default and every *_MODEL / *_PROVIDER in .env is
+        # ignored no matter what .env.example documents.
+        paper_balance=_float("PAPER_BALANCE", 200.0),
+        signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),
+        critic_model=_env("CRITIC_MODEL"),
+        burt_model=_env("BURT_MODEL"),
+        embedding_model=_env("EMBEDDING_MODEL", "openai/text-embedding-3-small"),
+        consolidation_model=_env("CONSOLIDATION_MODEL"),
+        signal_provider=_env("SIGNAL_PROVIDER", "openrouter"),
+        critic_provider=_env("CRITIC_PROVIDER", "openrouter"),
+        burt_provider=_env("BURT_PROVIDER", "openrouter"),
+        embedding_provider=_env("EMBEDDING_PROVIDER", "openrouter"),
+        consolidation_provider=_env("CONSOLIDATION_PROVIDER", "openrouter"),
+        signal_reasoning_effort=_env("SIGNAL_REASONING_EFFORT", "low"),
+        critic_reasoning_effort=_env("CRITIC_REASONING_EFFORT", "high"),
+        burt_reasoning_effort=_env("BURT_REASONING_EFFORT", "low"),
+        embedding_reasoning_effort=_env("EMBEDDING_REASONING_EFFORT"),
+        consolidation_reasoning_effort=_env("CONSOLIDATION_REASONING_EFFORT"),
+        signal_timeout=_float("SIGNAL_TIMEOUT", 30.0),
+        critic_timeout=_float("CRITIC_TIMEOUT", 90.0),
+        burt_timeout=_float("BURT_TIMEOUT", 45.0),
+        embedding_timeout=_float("EMBEDDING_TIMEOUT", 15.0),
+        consolidation_timeout=_float("CONSOLIDATION_TIMEOUT", 90.0),
     )

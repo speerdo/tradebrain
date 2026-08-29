@@ -10,7 +10,7 @@ async def test():
         "X-Title": "TradeBrain",
     }
     payload = {
-        "model": "moonshotai/kimi-k2.6",
+        "model": get_config().signal_model,
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Return JSON: {\"hello\": \"world\"}"},
