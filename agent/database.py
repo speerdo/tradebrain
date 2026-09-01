@@ -196,14 +196,16 @@ class Database:
         logger.debug(f"Logged trade {tid} for {trade['symbol']}")
         return tid
 
-    async def close_trade(self, trade_id: int, exit_price: float, pnl_usdc: float, status: str) -> None:
+    async def close_trade(self, trade_id: int, exit_price: float, pnl_usdc: float, status: str,
+                          realized_partial: float | None = None) -> None:
         await self.execute(
             """
             UPDATE trades
-            SET exit_price = $1, pnl_usdc = $2, status = $3, closed_at = NOW()
+            SET exit_price = $1, pnl_usdc = $2, status = $3, closed_at = NOW(),
+                realized_partial = COALESCE($5, realized_partial)
             WHERE id = $4
             """,
-            exit_price, pnl_usdc, status, trade_id,
+            exit_price, pnl_usdc, status, trade_id, realized_partial,
         )
         logger.info(f"Closed trade {trade_id}: status={status} pnl=${pnl_usdc:.2f}")
 
@@ -283,18 +285,29 @@ class Database:
     # Memory (Burt)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _vector_literal(embedding: list[float] | None) -> str | None:
+        """Convert an embedding list to a pgvector literal string.
+
+        asyncpg has no native codec for the pgvector `vector` type — binding a
+        Python list fails with "expected str, got list". pgvector accepts its
+        text representation ('[0.1,0.2,...]') with an explicit ::vector cast.
+        """
+        if embedding is None:
+            return None
+        return "[" + ",".join(f"{x!r}" for x in embedding) + "]"
+
     async def store_memory(self, memory_type: str, content: str, source: str = "",
                            symbol: str = "", strategy: str = "",
                            embedding: list[float] | None = None, importance: float = 0.5) -> int:
-        embedding_sql = "NULL" if embedding is None else f"ARRAY{embedding}::vector(1536)"
         sid = await self.fetchval(
             """
             INSERT INTO memories (memory_type, content, source, symbol, strategy, embedding, importance)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
             RETURNING id
             """,
             memory_type, content, source, symbol, strategy,
-            embedding if embedding is not None else [],
+            self._vector_literal(embedding),
             importance,
         )
         return sid
@@ -305,10 +318,10 @@ class Database:
             SELECT content, importance, memory_type, symbol, strategy
             FROM memories
             WHERE importance > $1
-            ORDER BY embedding <=> $2
+            ORDER BY embedding <=> $2::vector
             LIMIT $3
             """,
-            importance_threshold, embedding, limit,
+            importance_threshold, self._vector_literal(embedding), limit,
         )
 
     async def update_memory_importance(self, memory_id: int, importance: float) -> None:

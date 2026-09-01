@@ -173,7 +173,9 @@ class CoinbaseClient:
                         status=p.get("status", ""),
                         trading_enabled=not p.get("trading_disabled", True),
                         price=float(p["price"]) if p.get("price") else None,
-                        volume_24h=float(p.get("approximate_quote_24h_volume", 0)) or None,
+                        # Coinbase sends "" for empty numerics — float("") raises.
+                        volume_24h=float(p["approximate_quote_24h_volume"])
+                            if p.get("approximate_quote_24h_volume") else None,
                         max_leverage=max_lev,
                         funding_rate=None,
                         open_interest=None,

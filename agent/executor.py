@@ -148,7 +148,7 @@ class Executor:
         pos.exit_price = exit_price
         pos.pnl_usdc = pnl
         pos.status = "closed"
-        del self.paper_positions[product_id]
+        del self.paper_positions[pos.product_id]
         logger.info(f"📄 PAPER CLOSE: {pos.display_name} @ {exit_price:.2f} P&L=${pnl:+.2f}")
         await self._update_trade_close(pos)
         if self._notifier:
@@ -623,6 +623,73 @@ class Executor:
         """Open positions in BOTH modes — one accessor, paper + live."""
         return list(self.paper_positions.values()) + list(self.live_positions.values())
 
+    async def restore_paper_positions(self) -> list[PaperPosition]:
+        """
+        Rebuild in-memory paper positions from the trades table.
+
+        Paper positions otherwise live only in memory, so every restart
+        silently forgets open trades — their DB rows stay 'open' forever and
+        nothing ever stops them out or takes profit. The trades row is written
+        at entry (log_trade) and updated at close, so it is a complete source
+        of truth for open paper positions.
+        """
+        try:
+            db = await get_db()
+            rows = await db.fetch(
+                """
+                SELECT * FROM trades
+                WHERE status = 'open' AND is_paper = TRUE
+                  AND created_at >= NOW() - INTERVAL '7 days'
+                ORDER BY created_at ASC
+                """
+            )
+        except Exception as exc:
+            logger.error(f"Paper position restore failed: {exc}")
+            return []
+
+        restored: list[PaperPosition] = []
+        for row in rows:
+            # Stale test rows (e.g. the legacy ONDO entries with absurd
+            # margins) must not resurrect as managed positions. Anything
+            # without a usable product_id is unadoptable; the row can be
+            # closed manually or via SQL.
+            product_id = row["product_id"] or ""
+            if not product_id:
+                logger.warning(
+                    f"⚠️ RESTORE: trade {row['id']} ({row['symbol']}) has no "
+                    "product_id — cannot restore, leaving row open"
+                )
+                continue
+            if product_id in self.paper_positions:
+                continue  # duplicate row for a product we already hold
+            pos = PaperPosition(
+                product_id=product_id,
+                display_name=row["display_name"] or row["symbol"],
+                direction=row["direction"],
+                entry_price=float(row["entry_price"]),
+                stop_loss=float(row["stop_loss"] or 0.0),
+                take_profit=float(row["take_profit"] or 0.0),
+                size_usdc=float(row["size_usdc"]),
+                margin_usdc=float(row["margin_usdc"] or 0.0),
+                leverage=int(row["leverage"] or 1),
+                risk_usdc=float(row["risk_usdc"] or 0.0),
+                opened_at=row["created_at"].timestamp() if row["created_at"] else time.time(),
+                strategy=row["strategy"] or "",
+                confidence=float(row["confidence"] or 0.0),
+                reasoning=row["reasoning"] or "Restored from DB on restart",
+                is_paper=True,
+                realized_partial=float(row["realized_partial"] or 0.0)
+                    if "realized_partial" in row.keys() else 0.0,
+            )
+            self.paper_positions[product_id] = pos
+            restored.append(pos)
+        if restored:
+            logger.info(
+                f"♻️  Restored {len(restored)} open paper position(s) from DB: "
+                + ", ".join(f"{p.display_name} {p.direction} @ {p.entry_price:.2f}" for p in restored)
+            )
+        return restored
+
     def has_position(self, product_id: str) -> bool:
         return product_id in self.paper_positions or product_id in self.live_positions
 
@@ -664,6 +731,7 @@ class Executor:
                 pos.product_id,
             )
             if row:
-                await db.close_trade(row["id"], pos.exit_price or 0, pos.pnl_usdc, "closed")
+                await db.close_trade(row["id"], pos.exit_price or 0, pos.pnl_usdc, "closed",
+                                     realized_partial=pos.realized_partial)
         except Exception as exc:
             logger.warning(f"Failed to update close: {exc}")

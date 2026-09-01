@@ -110,6 +110,15 @@ class TradeBrainAgent:
         # report the 100k placeholder as the account size.
         await self.db.sync_config()
         await self.risk.sync()
+
+        # Paper positions are in-memory only — restore open ones from the
+        # trades table before the monitor, screener, or risk caps read them,
+        # or a restart would silently forget every open paper trade (rows
+        # stuck 'open' forever, no stop/TP ever fires).
+        restored = await self.executor.restore_paper_positions()
+        if restored:
+            logger.info(f"Paper restore: {len(restored)} position(s) back under management")
+
         logger.info(
             f"Account: ${self.risk.state.balance_usdc:,.2f} "
             f"({'PAPER' if self.cfg.paper_trading else 'LIVE'}) | "

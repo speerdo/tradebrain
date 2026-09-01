@@ -407,6 +407,13 @@ class Burt:
                 }
                 if route.provider == "openrouter":
                     payload["reasoning"] = {"exclude": True}
+                # Reasoning models (e.g. glm-5.3-flash:cloud via Ollama) burn the
+                # max_tokens budget on the `reasoning` field before any answer
+                # text is produced, yielding empty content with
+                # finish_reason=length. Low effort keeps the thinking short so
+                # real content survives the 800-token cap.
+                if route.provider == "ollama":
+                    payload["reasoning_effort"] = "low"
                 try:
                     resp = await client.post(
                         f"{route.base_url}/chat/completions",

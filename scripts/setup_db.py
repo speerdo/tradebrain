@@ -228,6 +228,10 @@ CREATE INDEX IF NOT EXISTS idx_news_symbol ON news_cache(symbol, created_at DESC
 -- P1: signal parse-failure instrumentation
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS parse_failed BOOLEAN DEFAULT FALSE;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS raw_response_snippet TEXT;
+
+-- Paper restart-safety: PnL already banked by partial take-profits on a paper
+-- position must survive restarts so the final close books the correct total.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS realized_partial FLOAT DEFAULT 0.0;
 """
 
 PGVECTOR_INDEX_SQL = """
