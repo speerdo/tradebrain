@@ -43,6 +43,7 @@ class PaperPosition:
     exit_price: float | None = None
     pnl_usdc: float = 0.0
     realized_partial: float = 0.0  # PnL already booked by partial take-profits
+    fees_usdc: float = 0.0  # Cumulative taker fees across entry + partial + exit legs
     tax_treatment: str = "1256"
     product_type: str = "perp"
 
@@ -108,16 +109,18 @@ class Executor:
                             reasoning: str) -> OrderResult:
         if product_id in self.paper_positions:
             return OrderResult(success=False, error=f"Already open: {product_id}")
+        entry_fee = self.fee_for_leg(size_usdc)
         pos = PaperPosition(
             product_id=product_id, display_name=display_name, direction=direction,
             entry_price=entry_price, stop_loss=stop_loss, take_profit=take_profit,
             size_usdc=size_usdc, margin_usdc=margin_usdc, leverage=leverage,
             risk_usdc=risk_usdc, strategy=strategy, confidence=confidence,
-            reasoning=reasoning, is_paper=True,
+            reasoning=reasoning, is_paper=True, fees_usdc=entry_fee,
         )
         self.paper_positions[product_id] = pos
         logger.info(
-            f"📄 PAPER ENTRY: {direction.upper()} {display_name} @ {entry_price:.2f}"
+            f"📄 PAPER ENTRY: {direction.upper()} {display_name} @ {entry_price:.2f} "
+            f"(entry fee ${entry_fee:.2f})"
         )
         await self._log_trade(pos, order_id="")
         if self._notifier:
@@ -143,13 +146,18 @@ class Executor:
         if exit_price is None:
             exit_price = pos.entry_price
         # Final PnL = PnL on the remaining size + anything already banked
-        # by partial take-profits.
-        pnl = self._calc_pnl(pos, exit_price) + pos.realized_partial
+        # by partial take-profits, net of every fee leg paid so far
+        # (entry + any partials) plus this exit fill.
+        pos.fees_usdc += self.fee_for_leg(pos.size_usdc)
+        pnl = self._calc_pnl(pos, exit_price) + pos.realized_partial - pos.fees_usdc
         pos.exit_price = exit_price
         pos.pnl_usdc = pnl
         pos.status = "closed"
         del self.paper_positions[pos.product_id]
-        logger.info(f"📄 PAPER CLOSE: {pos.display_name} @ {exit_price:.2f} P&L=${pnl:+.2f}")
+        logger.info(
+            f"📄 PAPER CLOSE: {pos.display_name} @ {exit_price:.2f} "
+            f"P&L=${pnl:+.2f} (fees ${pos.fees_usdc:.2f})"
+        )
         await self._update_trade_close(pos)
         if self._notifier:
             try:
@@ -182,14 +190,16 @@ class Executor:
                 or meta.get("current_price")
                 or pos.entry_price
             )
-            pnl = self._calc_pnl(pos, exit_price) + pos.realized_partial
+            pos.fees_usdc += self.fee_for_leg(pos.size_usdc)
+            pnl = self._calc_pnl(pos, exit_price) + pos.realized_partial - pos.fees_usdc
             pos.exit_price = exit_price
             pos.pnl_usdc = pnl
             pos.status = "closed"
             self.live_positions.pop(pos.product_id, None)
             self.live_meta.pop(pos.product_id, None)
             logger.info(
-                f"💰 LIVE CLOSE: {pos.display_name} @ ~{exit_price:.2f} P&L≈${pnl:+.2f}"
+                f"💰 LIVE CLOSE: {pos.display_name} @ ~{exit_price:.2f} "
+                f"P&L≈${pnl:+.2f} (fees ${pos.fees_usdc:.2f})"
             )
             await self._update_trade_close(pos)
             if self._notifier:
@@ -264,15 +274,16 @@ class Executor:
                     product_id, direction, contracts, stop_loss,
                 )
 
+            live_notional = contracts * entry_price * contract_size
             pos = PaperPosition(
                 product_id=product_id, display_name=display_name,
                 direction=direction, entry_price=entry_price,
                 stop_loss=stop_loss, take_profit=take_profit,
-                size_usdc=contracts * entry_price * contract_size,
+                size_usdc=live_notional,
                 margin_usdc=margin_usdc, leverage=leverage,
                 risk_usdc=risk_usdc, strategy=strategy,
                 confidence=confidence, reasoning=reasoning,
-                is_paper=False,
+                is_paper=False, fees_usdc=self.fee_for_leg(live_notional),
             )
             self.live_positions[product_id] = pos
             self.live_meta[product_id] = {
@@ -463,7 +474,8 @@ class Executor:
                 # here would hide a real loss from the circuit breaker and from
                 # the protections' R-tracking.
                 exit_price = meta.get("current_price") or pos.stop_loss or pos.entry_price
-                pnl = self._calc_pnl(pos, exit_price) + pos.realized_partial
+                pos.fees_usdc += self.fee_for_leg(pos.size_usdc)
+                pnl = self._calc_pnl(pos, exit_price) + pos.realized_partial - pos.fees_usdc
                 pos.exit_price = exit_price
                 pos.pnl_usdc = pnl
                 pos.status = "closed"
@@ -566,12 +578,15 @@ class Executor:
             else:
                 realized = (pos.entry_price - exit_price) / pos.entry_price * closed_notional
 
+            partial_fee = self.fee_for_leg(closed_notional)
             pos.realized_partial += realized
+            pos.fees_usdc += partial_fee
             pos.size_usdc -= closed_notional
             pos.margin_usdc *= (1 - fraction)
             logger.info(
                 f"📄 PAPER PARTIAL: closed {fraction:.0%} of {pos.display_name} "
-                f"@ {exit_price:.2f} banked ${realized:+.2f} (remaining ${pos.size_usdc:.2f})"
+                f"@ {exit_price:.2f} banked ${realized:+.2f} gross (fee ${partial_fee:.2f}) "
+                f"(remaining ${pos.size_usdc:.2f})"
             )
             return OrderResult(success=True, filled_price=exit_price)
 
@@ -594,13 +609,16 @@ class Executor:
                     realized = (exit_price - pos.entry_price) / pos.entry_price * closed_notional
                 else:
                     realized = (pos.entry_price - exit_price) / pos.entry_price * closed_notional
+                partial_fee = self.fee_for_leg(closed_notional)
                 pos.realized_partial += realized
+                pos.fees_usdc += partial_fee
                 pos.size_usdc -= closed_notional
                 pos.margin_usdc *= (1 - fraction)
                 meta["contracts"] = contracts - close_contracts
                 logger.info(
                     f"💰 LIVE PARTIAL: closed {close_contracts} contract(s) of "
-                    f"{pos.display_name} @ ~{exit_price:.2f} banked ${realized:+.2f}"
+                    f"{pos.display_name} @ ~{exit_price:.2f} banked ${realized:+.2f} gross "
+                    f"(fee ${partial_fee:.2f})"
                 )
                 # The old stop still covers the pre-partial contract count.
                 # Resize it, or on trigger it closes the remainder and opens a
@@ -618,6 +636,13 @@ class Executor:
         if pos.direction == "long":
             return (current - pos.entry_price) / pos.entry_price * pos.size_usdc
         return (pos.entry_price - current) / pos.entry_price * pos.size_usdc
+
+    def fee_for_leg(self, notional_usdc: float) -> float:
+        """Modeled taker fee for one fill (market orders only — entries and
+        exits are both taker). Coinbase's retail rate is a percentage with a
+        per-transaction minimum; at our position sizes the minimum is what
+        actually bites, not the percentage."""
+        return max(abs(notional_usdc) * self.cfg.taker_fee_pct, self.cfg.min_fee_usdc)
 
     def get_open_positions(self) -> list[PaperPosition]:
         """Open positions in BOTH modes — one accessor, paper + live."""
@@ -680,6 +705,8 @@ class Executor:
                 is_paper=True,
                 realized_partial=float(row["realized_partial"] or 0.0)
                     if "realized_partial" in row.keys() else 0.0,
+                fees_usdc=float(row["fees_usdc"] or 0.0)
+                    if "fees_usdc" in row.keys() else self.fee_for_leg(float(row["size_usdc"])),
             )
             self.paper_positions[product_id] = pos
             restored.append(pos)
@@ -719,6 +746,7 @@ class Executor:
                 "display_name": pos.display_name,
                 "tax_treatment": pos.tax_treatment,
                 "product_type": pos.product_type,
+                "fees_usdc": pos.fees_usdc,
             })
         except Exception as exc:
             logger.warning(f"Failed to log trade: {exc}")
@@ -732,6 +760,6 @@ class Executor:
             )
             if row:
                 await db.close_trade(row["id"], pos.exit_price or 0, pos.pnl_usdc, "closed",
-                                     realized_partial=pos.realized_partial)
+                                     realized_partial=pos.realized_partial, fees_usdc=pos.fees_usdc)
         except Exception as exc:
             logger.warning(f"Failed to update close: {exc}")

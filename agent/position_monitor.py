@@ -15,7 +15,6 @@ Exit management (B2):
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any
 
 from loguru import logger
 
@@ -58,12 +57,8 @@ class PositionMonitor:
         self.risk = risk
         self._task: asyncio.Task | None = None
         self._running = False
-        self._notifier: Any = None
         # Track per-position ATR at entry + original stop for R-multiple + trailing
         self._pos_meta: dict[str, dict] = {}  # product_id -> {atr, original_stop, original_size, partial_done}
-
-    def set_notifier(self, notifier: Any) -> None:
-        self._notifier = notifier
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -180,34 +175,64 @@ class PositionMonitor:
         # paper result as evidence about live behaviour — the same divergence
         # class as the P0 position-tracking bug. If partials are a bad idea,
         # ENABLE_PARTIAL_TP turns them off for both modes; never just one.
+        #
+        # A partial adds a third fee leg (entry + partial-exit + final-exit).
+        # At small position sizes the per-transaction fee minimum dominates,
+        # so skip the partial when the TOTAL fee burden across all three legs
+        # (entry already paid + this partial + the eventual final exit on
+        # what's left) would eat too much of the trade's $-at-risk — banking
+        # early isn't worth it if fees alone are a double-digit percentage of
+        # the R they're supposed to protect.
         if (ENABLE_PARTIAL_TP and not meta.get("partial_done")
                 and r_mult >= PARTIAL_TP_AT_R):
-            result = await self.executor.reduce_position(
-                pos.product_id, price, PARTIAL_TP_PCT
-            )
-            # Marked done either way: a live position too small to split (1
-            # contract) must not be retried on every 30s tick.
-            meta["partial_done"] = True
-            if result.success:
+            partial_notional = pos.size_usdc * PARTIAL_TP_PCT
+            remaining_notional = pos.size_usdc - partial_notional
+            partial_fee = self.executor.fee_for_leg(partial_notional)
+            est_final_fee = self.executor.fee_for_leg(remaining_notional)
+            total_fee_if_partial = pos.fees_usdc + partial_fee + est_final_fee
+            fee_budget = self.executor.cfg.fee_budget_pct_of_risk * pos.risk_usdc
+            if pos.risk_usdc > 0 and total_fee_if_partial > fee_budget:
+                meta["partial_done"] = True  # decision is final — risk_usdc doesn't change
                 logger.info(
-                    f"💰 {pos.display_name} partial TP at +{r_mult:.2f}R — "
-                    f"banked {PARTIAL_TP_PCT:.0%} @ {price:.2f}"
+                    f"⏭️  {pos.display_name} skipping partial TP @ +{r_mult:.2f}R — "
+                    f"3-leg fee burden ${total_fee_if_partial:.2f} > budget ${fee_budget:.2f} "
+                    f"({self.executor.cfg.fee_budget_pct_of_risk:.0%} of ${pos.risk_usdc:.2f} risk)"
                 )
             else:
-                logger.warning(f"Partial TP failed for {pos.display_name}: {result.error}")
+                result = await self.executor.reduce_position(
+                    pos.product_id, price, PARTIAL_TP_PCT
+                )
+                # Marked done either way: a live position too small to split (1
+                # contract) must not be retried on every 30s tick.
+                meta["partial_done"] = True
+                if result.success:
+                    logger.info(
+                        f"💰 {pos.display_name} partial TP at +{r_mult:.2f}R — "
+                        f"banked {PARTIAL_TP_PCT:.0%} @ {price:.2f}"
+                    )
+                else:
+                    logger.warning(f"Partial TP failed for {pos.display_name}: {result.error}")
 
-        # Breakeven move: at +1R, move stop to entry
-        if r_mult >= BREAKEVEN_AT_R:
+        # Breakeven move: at +1R, move stop to entry PLUS a buffer covering
+        # the fees already paid (entry, any partial) and the fee this exit
+        # will itself cost. Without the buffer, a stop hit exactly at entry
+        # is a guaranteed net loser once real fees apply — "breakeven" in
+        # name only.
+        if r_mult >= BREAKEVEN_AT_R and pos.size_usdc > 0:
+            fee_buffer_usdc = pos.fees_usdc + self.executor.fee_for_leg(pos.size_usdc)
+            fee_buffer_price = fee_buffer_usdc / pos.size_usdc * pos.entry_price
             if pos.direction == "long":
-                new_stop = max(pos.stop_loss, pos.entry_price)
+                be_price = pos.entry_price + fee_buffer_price
+                new_stop = max(pos.stop_loss, be_price)
                 if new_stop > pos.stop_loss:
                     pos.stop_loss = new_stop
-                    logger.info(f"📈 {pos.display_name} BE stop → {new_stop:.2f}")
+                    logger.info(f"📈 {pos.display_name} BE stop → {new_stop:.2f} (fee buffer ${fee_buffer_usdc:.2f})")
             else:
-                new_stop = min(pos.stop_loss, pos.entry_price)
+                be_price = pos.entry_price - fee_buffer_price
+                new_stop = min(pos.stop_loss, be_price)
                 if new_stop < pos.stop_loss:
                     pos.stop_loss = new_stop
-                    logger.info(f"📉 {pos.display_name} BE stop → {new_stop:.2f}")
+                    logger.info(f"📉 {pos.display_name} BE stop → {new_stop:.2f} (fee buffer ${fee_buffer_usdc:.2f})")
 
         # Trailing stop: after +1.5R, trail by ATR × mult
         if r_mult >= TRAILING_ACTIVATE_R and atr > 0:
@@ -259,15 +284,14 @@ class PositionMonitor:
             logger.error(f"Failed to close {pos.product_id}: {result.error}")
             return
 
-        # Recompute PnL at the actual exit price so risk tracking and the
-        # notification match the fill logged by the executor (snap PnL was
-        # marked at the observed price, not the SL/TP level). Includes any
-        # PnL already banked by partial take-profits.
-        if pos.direction == "long":
-            exit_pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.size_usdc
-        else:
-            exit_pnl = (pos.entry_price - exit_price) / pos.entry_price * pos.size_usdc
-        exit_pnl += pos.realized_partial
+        # Use the PnL the executor just computed and persisted, rather than
+        # recomputing from price — it's already net of every fee leg (entry,
+        # partial(s), this exit) and includes anything banked by partial
+        # take-profits. Recomputing here previously dropped fees, so risk
+        # tracking (circuit breaker, R-multiples) and the notification both
+        # ran on gross PnL while the DB recorded net — two different numbers
+        # for the same trade.
+        exit_pnl = pos.pnl_usdc
         snap.current_price = exit_price
         snap.unrealized_pnl = exit_pnl
 
@@ -284,15 +308,12 @@ class PositionMonitor:
         await self._notify(pos, snap)
 
     async def _notify(self, pos: PaperPosition, snap: PositionSnapshot) -> None:
+        # Log-only. executor.close_position() (called just above in
+        # _handle_exit) already sent the Discord/Burt "trade closed"
+        # notification for this exact close — calling the notifier again
+        # here duplicated every single close message (visible in the logs as
+        # two identical "CLOSED ..." Burt messages per trade).
         mode = "PAPER" if pos.is_paper else "LIVE"
         emoji = "🟢" if snap.unrealized_pnl >= 0 else "🔴"
         logger.info(f"{emoji} {mode} CLOSE: {pos.display_name} "
                    f"P&L=${snap.unrealized_pnl:+.2f}")
-        if self._notifier:
-            try:
-                await self._notifier.notify_trade_closed(
-                    pos.display_name, pos.direction, pos.entry_price,
-                    snap.current_price, snap.unrealized_pnl,
-                )
-            except Exception as exc:
-                logger.warning(f"Close notification failed: {exc}")

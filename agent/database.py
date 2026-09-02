@@ -166,8 +166,8 @@ class Database:
                 symbol, direction, strategy, confidence, entry_price,
                 stop_loss, take_profit, size_usdc, margin_usdc, leverage,
                 risk_usdc, is_paper, status, reasoning, order_id, signal_id,
-                product_id, display_name, tax_treatment, product_type
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                product_id, display_name, tax_treatment, product_type, fees_usdc
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
             RETURNING id
         """
         vals = (
@@ -191,23 +191,25 @@ class Database:
             trade.get("display_name", ""),
             trade.get("tax_treatment", "1256"),
             trade.get("product_type", "perp"),
+            trade.get("fees_usdc", 0.0),
         )
         tid = await self.fetchval(sql, *vals)
         logger.debug(f"Logged trade {tid} for {trade['symbol']}")
         return tid
 
     async def close_trade(self, trade_id: int, exit_price: float, pnl_usdc: float, status: str,
-                          realized_partial: float | None = None) -> None:
+                          realized_partial: float | None = None, fees_usdc: float | None = None) -> None:
         await self.execute(
             """
             UPDATE trades
             SET exit_price = $1, pnl_usdc = $2, status = $3, closed_at = NOW(),
-                realized_partial = COALESCE($5, realized_partial)
+                realized_partial = COALESCE($5, realized_partial),
+                fees_usdc = COALESCE($6, fees_usdc)
             WHERE id = $4
             """,
-            exit_price, pnl_usdc, status, trade_id, realized_partial,
+            exit_price, pnl_usdc, status, trade_id, realized_partial, fees_usdc,
         )
-        logger.info(f"Closed trade {trade_id}: status={status} pnl=${pnl_usdc:.2f}")
+        logger.info(f"Closed trade {trade_id}: status={status} pnl=${pnl_usdc:.2f} fees=${fees_usdc or 0:.2f}")
 
     async def get_open_trades(self) -> list[asyncpg.Record]:
         return await self.fetch(
@@ -226,12 +228,14 @@ class Database:
                 COUNT(*) FILTER (WHERE pnl_usdc > 0) AS wins,
                 COUNT(*) FILTER (WHERE pnl_usdc < 0) AS losses,
                 COALESCE(SUM(pnl_usdc) FILTER (WHERE created_at >= CURRENT_DATE), 0) AS pnl_today,
-                COALESCE(SUM(pnl_usdc), 0) AS pnl_total
+                COALESCE(SUM(pnl_usdc), 0) AS pnl_total,
+                COALESCE(SUM(fees_usdc), 0) AS fees_total
             FROM trades
             WHERE created_at >= CURRENT_DATE
         """)
         if row is None:
-            return {"closed_count": 0, "wins": 0, "losses": 0, "pnl_today": 0.0, "pnl_total": 0.0, "win_rate": 0.0}
+            return {"closed_count": 0, "wins": 0, "losses": 0, "pnl_today": 0.0, "pnl_total": 0.0,
+                    "fees_total": 0.0, "win_rate": 0.0}
         total_closed = row["closed_count"] or 0
         return {
             "closed_count": total_closed,
@@ -239,6 +243,7 @@ class Database:
             "losses": row["losses"] or 0,
             "pnl_today": float(row["pnl_today"] or 0),
             "pnl_total": float(row["pnl_total"] or 0),
+            "fees_total": float(row["fees_total"] or 0),
             "win_rate": (row["wins"] / total_closed * 100) if total_closed else 0.0,
         }
 

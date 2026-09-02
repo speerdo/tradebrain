@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS trades (
     product_id      TEXT,
     display_name    TEXT,
     tax_treatment   TEXT DEFAULT '1256',
-    product_type    TEXT DEFAULT 'perp'
+    product_type    TEXT DEFAULT 'perp',
+    fees_usdc       FLOAT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS agent_config (
@@ -232,6 +233,11 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS raw_response_snippet TEXT;
 -- Paper restart-safety: PnL already banked by partial take-profits on a paper
 -- position must survive restarts so the final close books the correct total.
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS realized_partial FLOAT DEFAULT 0.0;
+
+-- Fee accounting: pnl_usdc is now net of modeled taker fees (entry + exit +
+-- any partial-close legs) instead of gross. This column tracks the total
+-- fee drag per trade for reporting and post-mortems.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS fees_usdc FLOAT DEFAULT 0.0;
 """
 
 PGVECTOR_INDEX_SQL = """

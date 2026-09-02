@@ -82,6 +82,22 @@ class Config(BaseModel):
     signal_model: str = Field(default="moonshotai/kimi-k2.6")
 
     # ------------------------------------------------------------------
+    # Trading fees — CFM nano perpetual-style futures are taker-only here
+    # (every entry/exit is a market order). Coinbase's published retail rate
+    # is 0.02% per fill with a $0.15 minimum per transaction; the minimum
+    # dominates at our position sizes ($120 notional), so every fill costs
+    # ~$0.15 regardless of the percentage. Two fills (entry+exit) per trade,
+    # three if a partial take-profit fires.
+    # ------------------------------------------------------------------
+    taker_fee_pct: float = Field(default=0.0002)     # 0.02%
+    min_fee_usdc: float = Field(default=0.15)         # per-fill minimum
+    # Partial take-profit adds a third fee leg. Skip it when that leg's fee
+    # would eat more than this fraction of the trade's $-at-risk (risk_usdc) —
+    # otherwise the "diversification" of banking early costs more than it's
+    # worth at small size. Scales up automatically as risk_usdc grows.
+    fee_budget_pct_of_risk: float = Field(default=0.15)
+
+    # ------------------------------------------------------------------
     # Run-plane model roles (MODELS.md §6, §7) — hot-reloadable
     # ------------------------------------------------------------------
     critic_model: str = Field(default="")                  # "" → signal_model
@@ -245,6 +261,9 @@ def _build_config() -> Config:
         # keeps its class default and every *_MODEL / *_PROVIDER in .env is
         # ignored no matter what .env.example documents.
         paper_balance=_float("PAPER_BALANCE", 200.0),
+        taker_fee_pct=_float("TAKER_FEE_PCT", 0.0002),
+        min_fee_usdc=_float("MIN_FEE_USDC", 0.15),
+        fee_budget_pct_of_risk=_float("FEE_BUDGET_PCT_OF_RISK", 0.15),
         signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),
         critic_model=_env("CRITIC_MODEL"),
         burt_model=_env("BURT_MODEL"),

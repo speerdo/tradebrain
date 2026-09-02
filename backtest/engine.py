@@ -39,8 +39,9 @@ class BacktestConfig:
     fixed_stop_pct: float = 0.02
     stop_loss_method: str = "atr"
     min_confidence: float = 0.0          # backtest uses deterministic signals — no confidence gate by default
-    fee_taker_pct: float = 0.0005        # 5 bps taker
+    fee_taker_pct: float = 0.0002        # 2 bps taker — matches live CFM nano-perp retail rate
     fee_maker_pct: float = 0.0002        # 2 bps maker (unused for market entries — kept for future)
+    min_fee_usdc: float = 0.15           # per-fill minimum — dominates at small notional (mirrors config.min_fee_usdc)
     slippage_pct: float = 0.0005         # 5 bps slippage on entry/exit
     funding_rate_8h: float = 0.0001      # 1 bps per 8h — long pays when positive
     max_concurrent_positions: int = 3
@@ -205,7 +206,7 @@ class BacktestEngine:
                     t.bars_held = op.bars_held
                     gross_pnl = self._pnl(t.direction, t.entry_price, filled, op.remaining_size)
                     # remaining_size is already USD notional — fee is notional * rate
-                    exit_fee = op.remaining_size * self.cfg.fee_taker_pct
+                    exit_fee = self._fee(op.remaining_size)
                     t.fees_usdc += exit_fee
                     t.pnl_usdc = op.realized_partial + gross_pnl - t.fees_usdc - t.funding_usdc
                     t.pnl_r = self._pnl_r(op)
@@ -229,7 +230,7 @@ class BacktestEngine:
                         t.exit_reason = "time_exit"
                         t.bars_held = op.bars_held
                         gross_pnl = self._pnl(t.direction, t.entry_price, filled, op.remaining_size)
-                        exit_fee = op.remaining_size * self.cfg.fee_taker_pct
+                        exit_fee = self._fee(op.remaining_size)
                         t.fees_usdc += exit_fee
                         t.pnl_usdc = op.realized_partial + gross_pnl - t.fees_usdc - t.funding_usdc
                         t.pnl_r = self._pnl_r(op)
@@ -256,7 +257,7 @@ class BacktestEngine:
                     fill = fill - slip if t.direction == "long" else fill + slip
                     closed = op.remaining_size * self.cfg.partial_tp_pct
                     op.realized_partial += self._pnl(t.direction, t.entry_price, fill, closed)
-                    t.fees_usdc += closed * self.cfg.fee_taker_pct
+                    t.fees_usdc += self._fee(closed)
                     op.remaining_size -= closed
                     op.partial_filled = True
 
@@ -306,7 +307,7 @@ class BacktestEngine:
                                     fill_price = entry + slip
                                 else:
                                     fill_price = entry - slip
-                                entry_fee = notional * self.cfg.fee_taker_pct
+                                entry_fee = self._fee(notional)
                                 stop_distance = abs(fill_price - sl)
                                 trade = BacktestTrade(
                                     entry_time=bar_time,
@@ -348,7 +349,7 @@ class BacktestEngine:
             t.exit_time = last_time
             t.bars_held = op.bars_held
             gross_pnl = self._pnl(t.direction, t.entry_price, filled, op.remaining_size)
-            t.fees_usdc += op.remaining_size * self.cfg.fee_taker_pct
+            t.fees_usdc += self._fee(op.remaining_size)
             t.pnl_usdc = op.realized_partial + gross_pnl - t.fees_usdc - t.funding_usdc
             t.pnl_r = self._pnl_r(op)
             t.exit_reason = "end_of_data"
@@ -433,3 +434,9 @@ class BacktestEngine:
         if direction == "long":
             return (exit_price - entry) / entry * size_usdc
         return (entry - exit_price) / entry * size_usdc
+
+    def _fee(self, notional_usdc: float) -> float:
+        """Modeled taker fee for one fill — percentage with a per-transaction
+        minimum. Mirrors agent.executor.Executor.fee_for_leg so backtest and
+        live/paper agree on trading costs."""
+        return max(abs(notional_usdc) * self.cfg.fee_taker_pct, self.cfg.min_fee_usdc)

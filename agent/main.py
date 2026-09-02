@@ -56,7 +56,6 @@ class TradeBrainAgent:
         self.monitor = PositionMonitor(self.executor, self.cb, self.risk)
         self.burt = Burt(None, self.executor, self.risk, self.screener)
         self.notifier = Notifier(self.burt)
-        self.monitor.set_notifier(self.notifier)
         self.executor.set_notifier(self.notifier)
         # P0: positions closed on the exchange between monitor ticks never
         # reach PositionMonitor._handle_exit — the executor books them itself.
