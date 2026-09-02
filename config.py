@@ -49,7 +49,16 @@ class Config(BaseModel):
     # Trading defaults (all overridable in UI)
     # ------------------------------------------------------------------
     paper_trading: bool = Field(default=True)
-    default_leverage: int = Field(default=3)
+    # Screener only selects products with max_leverage >= 5 (screener.py
+    # MIN_LEVERAGE), so 5x is always available on anything we'd trade. At 3x,
+    # the 20%-of-balance margin cap binds on nearly every entry (ATR stops
+    # here are routinely <1% away), crushing notional down to a size where
+    # the $0.15/fill fee minimum dominates the trade's actual $-at-risk —
+    # replaying 9 live paper trades, fee/risk ratios ran 13%-179%. 5x roughly
+    # doubles achievable notional at the same margin, without increasing
+    # $-at-risk (the stop still defines that) or approaching liquidation —
+    # these stops are 10-100x closer than a 5x liquidation buffer (~20%).
+    default_leverage: int = Field(default=5)
     default_risk_per_trade: float = Field(default=0.01)       # 1%
     default_daily_loss_limit: float = Field(default=0.05)     # 5%
     default_strategy: str = Field(default="rsi_macd")
@@ -59,7 +68,7 @@ class Config(BaseModel):
     burt_active_hours_end: int = Field(default=22)
 
     # Config keys that can be hot-reloaded from DB
-    leverage: int = Field(default=3)
+    leverage: int = Field(default=5)
     risk_per_trade: float = Field(default=0.01)
     daily_loss_limit: float = Field(default=0.05)
     strategy: str = Field(default="rsi_macd")
@@ -96,6 +105,14 @@ class Config(BaseModel):
     # otherwise the "diversification" of banking early costs more than it's
     # worth at small size. Scales up automatically as risk_usdc grows.
     fee_budget_pct_of_risk: float = Field(default=0.15)
+    # Reject an entry outright when its round-trip (entry+exit) fee alone —
+    # unavoidable on every trade, unlike the partial's optional 3rd leg —
+    # would exceed this fraction of $-at-risk. Catches stops so tight that
+    # even a full-margin-cap position can't earn back its own transaction
+    # cost (e.g. a 0.14% stop, notional-capped at $120: fees are 179% of
+    # risk). Higher than fee_budget_pct_of_risk on purpose — an unavoidable
+    # cost gets more room than an optional one.
+    entry_fee_budget_pct_of_risk: float = Field(default=0.30)
 
     # ------------------------------------------------------------------
     # Run-plane model roles (MODELS.md §6, §7) — hot-reloadable
@@ -247,7 +264,7 @@ def _build_config() -> Config:
         ollama_api_key=_env("OLLAMA_API_KEY"),
         ollama_base_url=_env("OLLAMA_BASE_URL", "https://ollama.com/v1"),
         paper_trading=_bool("PAPER_TRADING", True),
-        default_leverage=_int("DEFAULT_LEVERAGE", 3),
+        default_leverage=_int("DEFAULT_LEVERAGE", 5),
         default_risk_per_trade=_float("DEFAULT_RISK_PER_TRADE", 0.01),
         default_daily_loss_limit=_float("DEFAULT_DAILY_LOSS_LIMIT", 0.05),
         default_strategy=_env("DEFAULT_STRATEGY", "rsi_macd"),
@@ -264,6 +281,7 @@ def _build_config() -> Config:
         taker_fee_pct=_float("TAKER_FEE_PCT", 0.0002),
         min_fee_usdc=_float("MIN_FEE_USDC", 0.15),
         fee_budget_pct_of_risk=_float("FEE_BUDGET_PCT_OF_RISK", 0.15),
+        entry_fee_budget_pct_of_risk=_float("ENTRY_FEE_BUDGET_PCT_OF_RISK", 0.30),
         signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),
         critic_model=_env("CRITIC_MODEL"),
         burt_model=_env("BURT_MODEL"),

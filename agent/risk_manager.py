@@ -44,10 +44,25 @@ class RiskParams:
 
 
 def compute_position_size(entry_price: float, stop_price: float,
-                          balance: float, risk_pct: float, leverage: int) -> tuple[float, float, float]:
+                          balance: float, risk_pct: float, leverage: int,
+                          taker_fee_pct: float = 0.0, min_fee_usdc: float = 0.0,
+                          entry_fee_budget_pct: float | None = None,
+                          ) -> tuple[float, float, float]:
     """
-    Returns (notional_size, margin_required, risk_usdc).
-    Safety cap: margin <= 20% of balance.
+    Returns (notional_size, margin_required, risk_usdc) — all zero if the
+    trade is rejected.
+
+    Safety cap: margin <= 20% of balance. A tight stop wants more notional
+    than the cap allows, so `risk_usdc` (the 3rd return value) is the ACTUAL
+    dollar risk after any cap-scaling, not the nominal `balance * risk_pct`
+    the caller asked for — callers must use this value, not recompute their
+    own, or every R-multiple and fee-ratio calc downstream silently uses the
+    wrong denominator.
+
+    If `entry_fee_budget_pct` is set, also rejects (returns all zeros) when
+    the round-trip taker fee on the capped notional would exceed that
+    fraction of the actual risk — a stop distance small enough that even a
+    max-margin position can't earn back its own entry+exit cost.
     """
     risk_dollars = balance * risk_pct
     stop_distance_pct = abs(entry_price - stop_price) / entry_price
@@ -66,6 +81,17 @@ def compute_position_size(entry_price: float, stop_price: float,
         risk_dollars *= scale
         margin_required = notional_size / leverage
         logger.warning(f"Position scaled down to fit 20% margin cap: margin=${margin_required:.2f}")
+
+    if entry_fee_budget_pct is not None and risk_dollars > 0:
+        round_trip_fee = 2 * max(notional_size * taker_fee_pct, min_fee_usdc)
+        fee_budget = entry_fee_budget_pct * risk_dollars
+        if round_trip_fee > fee_budget:
+            logger.info(
+                f"Skipping entry — stop too tight for this account: round-trip fee "
+                f"${round_trip_fee:.2f} > {entry_fee_budget_pct:.0%} of ${risk_dollars:.2f} "
+                f"risk (would size to ${notional_size:.2f} notional)"
+            )
+            return 0.0, 0.0, 0.0
 
     return notional_size, margin_required, risk_dollars
 
@@ -465,8 +491,15 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def calculate_trade_params(self, direction: str, entry_price: float,
-                               atr: float | None) -> tuple[float, float, float, float]:
-        """Returns (stop_loss, take_profit, notional_size, margin_required)."""
+                               atr: float | None) -> tuple[float, float, float, float, float]:
+        """Returns (stop_loss, take_profit, notional_size, margin_required, risk_usdc).
+
+        `risk_usdc` is the ACTUAL dollar risk after margin-cap scaling and any
+        fee-based rejection — use it, don't recompute `balance * risk_pct`
+        (that nominal figure is routinely wrong once the 20%-margin cap
+        binds, which it does on nearly every tight-stop entry at this
+        account size).
+        """
         sl, tp = compute_stops(
             entry_price, atr,
             atr_mult=self.state.atr_multiplier,
@@ -482,5 +515,8 @@ class RiskManager:
             self.state.balance_usdc,
             scaled_risk,
             self.state.leverage,
+            taker_fee_pct=self.cfg.taker_fee_pct,
+            min_fee_usdc=self.cfg.min_fee_usdc,
+            entry_fee_budget_pct=self.cfg.entry_fee_budget_pct_of_risk,
         )
-        return sl, tp, notional, margin
+        return sl, tp, notional, margin, risk

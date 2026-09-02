@@ -277,7 +277,7 @@ class TradeBrainAgent:
                 return
 
             entry = sig.entry_price or indicators["15m"]["price"]
-            sl, tp, notional, margin = self.risk.calculate_trade_params(
+            sl, tp, notional, margin, risk_usdc = self.risk.calculate_trade_params(
                 sig.direction, entry, indicators["15m"]["atr"]
             )
             if notional <= 0 or margin <= 0:
@@ -293,7 +293,7 @@ class TradeBrainAgent:
                 size_usdc=notional,
                 margin_usdc=margin,
                 leverage=self.risk.state.leverage,
-                risk_usdc=self.risk.state.balance_usdc * self.risk.state.risk_per_trade_pct,
+                risk_usdc=risk_usdc,
                 strategy=strategy.name,
                 confidence=sig.confidence,
                 reasoning=sig.reasoning,
