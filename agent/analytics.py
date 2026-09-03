@@ -63,7 +63,7 @@ def _max_drawdown(equity: list[float]) -> float:
     return max_dd
 
 
-async def compute_analytics(starting_balance: float = 100_000.0) -> dict:
+async def compute_analytics(starting_balance: float | None = None) -> dict:
     """
     Compute full analytics from the trades table.
 
@@ -71,8 +71,20 @@ async def compute_analytics(starting_balance: float = 100_000.0) -> dict:
       - equity_curve: list of {time, equity}
       - summary: overall metrics
       - by_strategy, by_symbol, by_hour, by_confidence: sliced stats
+
+    `starting_balance` defaults to the persistent paper balance for paper
+    mode (100k placeholder for live) so the equity curve reflects the real,
+    PnL-updated account rather than a hardcoded number.
     """
     db = await get_db()
+    if starting_balance is None:
+        starting_balance = 100_000.0
+        key = await db.get_config_value("paper_balance")
+        if key is not None:
+            try:
+                starting_balance = float(key)
+            except ValueError:
+                pass
     rows = await db.fetch(
         """
         SELECT symbol, direction, strategy, confidence, entry_price, exit_price,

@@ -487,6 +487,7 @@ class Burt:
         cb_state = "TRIPPED" if self.risk.state.circuit_breaker_active else "ok"
         mode = "paper" if self.cfg.paper_trading else "LIVE"
         universe_line = await self._get_products_summary()
+        balance_line = f"Account balance: ${self.risk.state.balance_usdc:,.2f} (includes all realized paper P&L)"
 
         return (
             "You are Burt, the personality and chat interface for a crypto-perps "
@@ -496,6 +497,7 @@ class Burt:
             "Be conversational — this is a Discord chat, not a status report.\n\n"
             "LIVE STATE (refreshed every turn):\n"
             f"Mode: {mode}  |  Risk: {pause_state}  |  Circuit breaker: {cb_state}\n"
+            f"{balance_line}\n"
             f"{stats_line}\n"
             f"{universe_line}\n"
             "Open positions:\n"

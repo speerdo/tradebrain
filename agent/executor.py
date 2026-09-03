@@ -159,6 +159,7 @@ class Executor:
             f"P&L=${pnl:+.2f} (fees ${pos.fees_usdc:.2f})"
         )
         await self._update_trade_close(pos)
+        await self._apply_paper_pnl(pnl)
         if self._notifier:
             try:
                 await self._notifier.notify_trade_closed(
@@ -763,3 +764,26 @@ class Executor:
                                      realized_partial=pos.realized_partial, fees_usdc=pos.fees_usdc)
         except Exception as exc:
             logger.warning(f"Failed to update close: {exc}")
+
+    async def _apply_paper_pnl(self, pnl: float) -> None:
+        """
+        Bank realized paper PnL into the persistent balance.
+
+        `paper_balance` in agent_config is the paper account's source of truth
+        (risk.sync() pushes it into risk.state.balance_usdc each loop tick, and
+        Burt / the UI report from that). Without this, paper PnL evaporates —
+        the balance only ever changes via manual UI edits, so sizing, daily
+        loss limits and Burt's account reports all run off a static number.
+        """
+        if not self.cfg.paper_trading:
+            return
+        try:
+            db = await get_db()
+            bal = await db.get_config_value("paper_balance")
+            current = float(bal) if bal is not None else float(self.cfg.paper_balance or 0)
+            new_bal = round(current + pnl, 2)
+            await db.set_config("paper_balance", str(new_bal))
+            config.set_config_key("paper_balance", new_bal)
+            logger.info(f"💰 Paper balance: ${current:,.2f} → ${new_bal:,.2f} (P&L ${pnl:+.2f})")
+        except Exception as exc:
+            logger.warning(f"Failed to persist paper balance: {exc}")

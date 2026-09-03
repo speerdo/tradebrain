@@ -157,7 +157,8 @@ INSERT INTO agent_config (key, value) VALUES
     ('critic_provider', 'openrouter'),
     ('burt_provider', 'openrouter'),
     ('embedding_provider', 'openrouter'),
-    ('consolidation_provider', 'openrouter')
+    ('consolidation_provider', 'openrouter'),
+    ('paper_balance', '200')
 ON CONFLICT (key) DO NOTHING;
 
 -- =========================================================================
