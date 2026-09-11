@@ -14,6 +14,7 @@ Entry point. Startup sequence:
 import asyncio
 import os
 import signal
+import sys
 
 import uvicorn
 from loguru import logger
@@ -192,10 +193,10 @@ class TradeBrainAgent:
                         )
                     else:
                         for symbol in self.watchlist:
-                            await self._evaluate(symbol, regime_ctx, fng)
+                            await self._evaluate_guarded(symbol, regime_ctx, fng)
                 else:
                     for symbol in self.watchlist:
-                        await self._evaluate(symbol, regime_ctx, fng)
+                        await self._evaluate_guarded(symbol, regime_ctx, fng)
 
                 await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -203,6 +204,28 @@ class TradeBrainAgent:
             except Exception as exc:
                 logger.error(f"Loop error: {exc}")
                 await asyncio.sleep(5)
+
+    # Hard ceiling on a single symbol's evaluation. Every external call inside
+    # _evaluate (candles, derivatives, sentiment, LLM, embeddings) already
+    # carries its own timeout, but a gap in that chain (e.g. a DB query or a
+    # connection-pool wait with no timeout) can still hang forever and freeze
+    # the whole loop — as happened on 2026-09-03, where the bot sat idle for
+    # 13+ hours after stalling mid-watchlist. This belt-and-suspenders timeout
+    # guarantees the loop always moves on to the next symbol/tick.
+    _EVALUATE_TIMEOUT_SEC = 180
+
+    async def _evaluate_guarded(self, product_id: str, regime_ctx: dict | None = None,
+                                 fng: dict | None = None) -> None:
+        try:
+            await asyncio.wait_for(
+                self._evaluate(product_id, regime_ctx, fng),
+                timeout=self._EVALUATE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Watchdog: {product_id} evaluation exceeded "
+                f"{self._EVALUATE_TIMEOUT_SEC}s — abandoning and moving on"
+            )
 
     async def _evaluate(self, product_id: str, regime_ctx: dict | None = None,
                         fng: dict | None = None) -> None:
@@ -275,6 +298,29 @@ class TradeBrainAgent:
             if news and self.sentiment.has_high_panic_news(news):
                 logger.info(f"Skip {product_id}: high-panic news veto")
                 return
+
+            # Per-symbol trend filter (log-driven, 2026-09-01..10): every
+            # NEAR/HYPE/LINK loss was a long entered while price sat below
+            # its 1h EMA50 — the global regime gate says nothing about an
+            # individual symbol's trend. Mechanically block counter-trend
+            # entries; the signal's entry_price may be a level the LLM wants
+            # to see filled, so compare the CURRENT price instead.
+            i_1h = indicators.get("1h", {})
+            trend_price = i_1h.get("price")
+            trend_ema = i_1h.get("ema50")
+            if trend_price and trend_ema:
+                if sig.direction == "long" and trend_price < trend_ema:
+                    logger.info(
+                        f"Skip {product_id}: trend filter — long blocked, "
+                        f"1h price {trend_price:.4f} < EMA50 {trend_ema:.4f}"
+                    )
+                    return
+                if sig.direction == "short" and trend_price > trend_ema:
+                    logger.info(
+                        f"Skip {product_id}: trend filter — short blocked, "
+                        f"1h price {trend_price:.4f} > EMA50 {trend_ema:.4f}"
+                    )
+                    return
 
             entry = sig.entry_price or indicators["15m"]["price"]
             sl, tp, notional, margin, risk_usdc = self.risk.calculate_trade_params(
@@ -362,7 +408,24 @@ class TradeBrainAgent:
         self._shutdown.set()
 
 
+def _setup_logging() -> None:
+    """Durable file sink. Previously logs only went wherever stdout happened
+    to be redirected at launch time — if the process was started without a
+    shell redirect (e.g. a bare `python -m agent.main` in a terminal), the
+    log file silently went stale while the process kept running, hiding a
+    later hang for hours."""
+    logger.add(
+        "logs/agent.log",
+        rotation="20 MB",
+        retention=5,
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+    )
+
+
 def main() -> None:
+    _setup_logging()
     agent = TradeBrainAgent()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

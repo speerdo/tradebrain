@@ -115,7 +115,7 @@ asyncio.run(test())
 "
 
 # 5. Terminal A — start the agent (this also starts Burt + the API)
-python -m agent.main
+venv/bin/python -m agent.main
 
 # 6. Terminal B — start the dashboard
 cd ui && npm install && npm run dev

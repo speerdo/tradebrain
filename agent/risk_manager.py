@@ -38,6 +38,10 @@ class RiskParams:
     stoploss_guard_window_h: int = 4         # lookback window in hours
     stoploss_guard_cooldown_h: int = 2       # global cooldown after trip
     per_symbol_cooldown_h: float = 1.0       # lockout after closing a position in a symbol
+    # Log-driven (2026-09-01..10): NEAR lost 3 straight full-R stop-outs
+    # (-$2.27, -$2.18, -$2.31) hours apart — the 1h cooldown let the bot
+    # re-enter the same falling market and buy each successive rally.
+    losing_close_cooldown_h: float = 4.0      # replaces the base cooldown after a loss
     losing_symbol_window_d: int = 7          # LosingSymbolLock lookback
     losing_symbol_threshold_r: float = -2.0  # ≤ -2R cumulative → bench
     churn_limit_per_day: int = 10            # max N new positions per day
@@ -155,10 +159,15 @@ class Protections:
         now = time.time()
         self._stopouts.append((now, symbol))
 
-    def record_close(self, symbol: str, pnl_r: float, cooldown_h: float) -> None:
+    def record_close(self, symbol: str, pnl_r: float, cooldown_h: float,
+                     losing_cooldown_h: float | None = None) -> None:
         """Called whenever a position closes. pnl_r = pnl / initial $-at-risk."""
         now = time.time()
-        # Per-symbol cooldown
+        # Per-symbol cooldown — extended after a losing close. Re-entering a
+        # symbol that just stopped you out is how one bad trend becomes three
+        # losses in a day (NEAR, 2026-09-03..04).
+        if pnl_r < 0 and losing_cooldown_h is not None:
+            cooldown_h = max(cooldown_h, losing_cooldown_h)
         self._symbol_cooldown[symbol] = now + cooldown_h * 3600
         # Stoploss tracking — only meaningful losses count toward the guard.
         # A -0.05R time exit is not a stop-out; without this threshold a few
@@ -448,7 +457,8 @@ class RiskManager:
         # Protections (B1) — record the outcome
         if symbol:
             self.protections.record_close(
-                symbol, pnl_r, self.state.per_symbol_cooldown_h
+                symbol, pnl_r, self.state.per_symbol_cooldown_h,
+                losing_cooldown_h=self.state.losing_close_cooldown_h,
             )
 
         if pnl_usdc >= 0:

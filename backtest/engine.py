@@ -54,10 +54,12 @@ class BacktestConfig:
     trailing_activate_r: float = 1.5
     trailing_atr_mult: float = 2.0
     enable_partial_tp: bool = True   # mirrors live position_monitor default
-    partial_tp_r: float = 1.0
-    partial_tp_pct: float = 0.5
+    partial_tp_r: float = 1.5
+    partial_tp_pct: float = 0.3
     enable_time_exit: bool = True
     max_hold_bars: int = 48              # 48 * 15m = 12h
+    # Time exit only fires below this R — winners keep running (mirrors live)
+    time_exit_min_r: float = 0.5
 
 
 @dataclass
@@ -215,28 +217,35 @@ class BacktestEngine:
                     open_positions.remove(op)
 
             # --- Time-based exit ---
+            # Mirror of live position_monitor: the deadline only force-closes
+            # positions that haven't paid (< time_exit_min_r). A winner past
+            # max_hold_bars keeps running on its trailed stop.
             if self.cfg.enable_time_exit:
                 for op in list(open_positions):
-                    if op.bars_held >= self.cfg.max_hold_bars:
-                        t = op.trade
-                        filled = current_price
-                        slip = filled * self.cfg.slippage_pct
-                        if t.direction == "long":
-                            filled -= slip
-                        else:
-                            filled += slip
-                        t.exit_price = filled
-                        t.exit_time = bar_time
-                        t.exit_reason = "time_exit"
-                        t.bars_held = op.bars_held
-                        gross_pnl = self._pnl(t.direction, t.entry_price, filled, op.remaining_size)
-                        exit_fee = self._fee(op.remaining_size)
-                        t.fees_usdc += exit_fee
-                        t.pnl_usdc = op.realized_partial + gross_pnl - t.fees_usdc - t.funding_usdc
-                        t.pnl_r = self._pnl_r(op)
-                        balance += t.pnl_usdc
-                        result.trades.append(t)
-                        open_positions.remove(op)
+                    if op.bars_held < self.cfg.max_hold_bars:
+                        continue
+                    t = op.trade
+                    r_multiple = self._r_multiple(op, current_price)
+                    if r_multiple >= self.cfg.time_exit_min_r:
+                        continue
+                    filled = current_price
+                    slip = filled * self.cfg.slippage_pct
+                    if t.direction == "long":
+                        filled -= slip
+                    else:
+                        filled += slip
+                    t.exit_price = filled
+                    t.exit_time = bar_time
+                    t.exit_reason = "time_exit"
+                    t.bars_held = op.bars_held
+                    gross_pnl = self._pnl(t.direction, t.entry_price, filled, op.remaining_size)
+                    exit_fee = self._fee(op.remaining_size)
+                    t.fees_usdc += exit_fee
+                    t.pnl_usdc = op.realized_partial + gross_pnl - t.fees_usdc - t.funding_usdc
+                    t.pnl_r = self._pnl_r(op)
+                    balance += t.pnl_usdc
+                    result.trades.append(t)
+                    open_positions.remove(op)
 
             # --- Partial take-profit (intra-bar: fires if high/low reaches +partial_tp_r) ---
             if self.cfg.enable_partial_tp:

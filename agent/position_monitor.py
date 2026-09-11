@@ -8,8 +8,10 @@ Checks every 30 seconds:
 Exit management (B2):
 - Breakeven move: at +1R, move stop to entry (+fees)
 - Trailing stop: after +1.5R, trail by ATR × multiplier; ratchets toward profit
-- Time-based exit: positions open > max_hold_h get closed
-- Partial TP: handled via reduce-only order amendment (live) / notional split (paper)
+- Time-based exit: positions open > max_hold_h get closed IF not yet in
+  meaningful profit (< +0.5R) — winners run on their trailed stop
+- Partial TP: 30% at +1.5R — handled via reduce-only order amendment (live)
+  / notional split (paper)
 """
 
 import asyncio
@@ -30,9 +32,18 @@ BREAKEVEN_AT_R = 1.0
 TRAILING_ACTIVATE_R = 1.5
 TRAILING_ATR_MULT = 2.0
 MAX_HOLD_H = 12.0
-PARTIAL_TP_AT_R = 1.0      # bank half at +1R, let the rest run
-PARTIAL_TP_PCT = 0.5
+# Log-driven (2026-09-01..10, 15 closed trades): every loss was a full -1R
+# stop-out while every winner was capped at ~+0.5R by the partial at +1R
+# banking HALF the position — the runner never reached the 2R+ target and
+# the 12h time exit closed the rest flat. Avg win $0.63 vs avg loss $1.36
+# required a 68% win rate to break even. Partial later (1.5R) and smaller
+# (30%) so the runner is 70% of the book.
+PARTIAL_TP_AT_R = 1.5
+PARTIAL_TP_PCT = 0.3
 ENABLE_PARTIAL_TP = True
+# Force-close at MAX_HOLD_H only when the position hasn't paid — closing
+# winners at the deadline was converting +1R runners into 0R time exits.
+TIME_EXIT_MIN_R = 0.5
 
 
 @dataclass
@@ -167,9 +178,9 @@ class PositionMonitor:
         else:
             r_mult = (pos.entry_price - price) / stop_distance
 
-        # Partial take-profit: bank PARTIAL_TP_PCT of the position at +1R.
-        # Combined with the breakeven move below, the remainder becomes a
-        # risk-free runner.
+        # Partial take-profit: bank PARTIAL_TP_PCT (30%) of the position at
+        # +PARTIAL_TP_AT_R (1.5R). Combined with the breakeven move below,
+        # the remainder becomes a risk-free runner.
         # Runs in BOTH modes. Gating this on `pos.is_paper` made paper and live
         # take structurally different exits, which silently invalidates every
         # paper result as evidence about live behaviour — the same divergence
@@ -259,10 +270,29 @@ class PositionMonitor:
                      "taken_profit" if price <= pos.take_profit else "open"
 
         # --- Time-based exit (B2) ---
+        # Only applies to positions that haven't paid yet (< TIME_EXIT_MIN_R).
+        # A winner past the deadline keeps running — its trailed stop is the
+        # exit, not the clock. R is measured against the ORIGINAL stop (meta),
+        # not the current (breakeven/trailed) stop.
         if status == "open":
             hold_h = (time.time() - pos.opened_at) / 3600
             if hold_h >= MAX_HOLD_H:
-                status = "time_exit"
+                meta = self._pos_meta.get(pos.product_id, {})
+                original_stop = meta.get("original_stop", pos.stop_loss)
+                stop_distance = abs(pos.entry_price - original_stop)
+                if stop_distance <= 0:
+                    r_mult = 0.0
+                elif pos.direction == "long":
+                    r_mult = (price - pos.entry_price) / stop_distance
+                else:
+                    r_mult = (pos.entry_price - price) / stop_distance
+                if r_mult < TIME_EXIT_MIN_R:
+                    status = "time_exit"
+                else:
+                    logger.debug(
+                        f"{pos.display_name} past {MAX_HOLD_H:.0f}h at "
+                        f"+{r_mult:.2f}R — letting the runner continue"
+                    )
 
         return PositionSnapshot(
             product_id=pos.product_id, direction=pos.direction,

@@ -110,9 +110,10 @@ class Config(BaseModel):
     # would exceed this fraction of $-at-risk. Catches stops so tight that
     # even a full-margin-cap position can't earn back its own transaction
     # cost (e.g. a 0.14% stop, notional-capped at $120: fees are 179% of
-    # risk). Higher than fee_budget_pct_of_risk on purpose — an unavoidable
-    # cost gets more room than an optional one.
-    entry_fee_budget_pct_of_risk: float = Field(default=0.30)
+    # risk). Tightened 0.30→0.15 after the 2026-09-01..10 logs showed tiny-
+    # risk trades slipping through ($0.17-$0.25 at-risk) whose full-size
+    # wins capped at pocket change while losses still paid full fees.
+    entry_fee_budget_pct_of_risk: float = Field(default=0.15)
 
     # ------------------------------------------------------------------
     # Run-plane model roles (MODELS.md §6, §7) — hot-reloadable
@@ -281,7 +282,7 @@ def _build_config() -> Config:
         taker_fee_pct=_float("TAKER_FEE_PCT", 0.0002),
         min_fee_usdc=_float("MIN_FEE_USDC", 0.15),
         fee_budget_pct_of_risk=_float("FEE_BUDGET_PCT_OF_RISK", 0.15),
-        entry_fee_budget_pct_of_risk=_float("ENTRY_FEE_BUDGET_PCT_OF_RISK", 0.30),
+        entry_fee_budget_pct_of_risk=_float("ENTRY_FEE_BUDGET_PCT_OF_RISK", 0.15),
         signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),
         critic_model=_env("CRITIC_MODEL"),
         burt_model=_env("BURT_MODEL"),
