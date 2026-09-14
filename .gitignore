@@ -41,6 +41,7 @@ ENV/
 logs/*.log
 logs/*.log.*
 logs/*.txt
+logs/*.out
 !logs/.gitkeep
 
 # ---- Environment ----

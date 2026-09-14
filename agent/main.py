@@ -15,6 +15,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 
 import uvicorn
 from loguru import logger
@@ -153,13 +154,35 @@ class TradeBrainAgent:
         finally:
             await self.shutdown()
 
+    # Per-tick plumbing (config sync, screener, regime, sentiment) previously
+    # ran with no timeout of its own. On 2026-09-11 one of these calls hung
+    # (no exception, no log line) and froze the whole loop for 3+ days
+    # straight — Burt kept adjusting min_confidence/risk/strategy over Discord
+    # the entire time, but nothing ever consumed those changes because the
+    # loop that reads them had already died. _evaluate_guarded already
+    # watchdogs the per-symbol call; these tick-level calls need the same
+    # belt-and-suspenders treatment so a single stuck HTTP/DB call can never
+    # again take down days of trading silently.
+    _TICK_STEP_TIMEOUT_SEC = 45
+
+    async def _tick_step(self, name: str, coro, default=None):
+        try:
+            return await asyncio.wait_for(coro, timeout=self._TICK_STEP_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Watchdog: '{name}' exceeded {self._TICK_STEP_TIMEOUT_SEC}s — "
+                f"using fallback and moving on"
+            )
+            return default
+
     async def _loop(self) -> None:
         screener_counter = 0
 
         while not self._shutdown.is_set():
+            tick_started = time.monotonic()
             try:
-                await self.db.sync_config()
-                await self.risk.sync()
+                await self._tick_step("db.sync_config", self.db.sync_config())
+                await self._tick_step("risk.sync", self.risk.sync())
 
                 # Read hot-reload values fresh each iteration so UI/Burt edits
                 # take effect on the next tick instead of requiring a restart.
@@ -170,19 +193,30 @@ class TradeBrainAgent:
                 screener_counter += 1
                 if screener_counter >= screener_interval:
                     screener_counter = 0
-                    self.watchlist = await self.screener.run()
+                    new_watchlist = await self._tick_step(
+                        "screener.run", self.screener.run(), default=None
+                    )
+                    if new_watchlist is not None:
+                        self.watchlist = new_watchlist
 
                 # Fetch market regime once per loop (C1) — injected into prompts
-                # and used to mechanically gate strategies.
-                regime_ctx = await self.regime_engine.get_context()
-                current_regime = regime_ctx.get("regime", "unknown")
+                # and used to mechanically gate strategies. Falls open to
+                # "unknown" on timeout, same as regime.py's own internal
+                # exception handling.
+                regime_ctx = await self._tick_step(
+                    "regime.get_context", self.regime_engine.get_context(),
+                    default={"btc_dominance": 0.5, "regime": "unknown", "context_tickers": []},
+                )
 
                 # Fetch Fear & Greed once per loop (C4) — shared across all symbols
-                fng = await self.sentiment.get_fear_greed()
+                fng = await self._tick_step(
+                    "sentiment.get_fear_greed", self.sentiment.get_fear_greed(), default={}
+                )
 
                 # Regime gate: skip strategy if it's not compatible with the current
                 # regime. "unknown" (regime fetch failed) fails OPEN — a transient
                 # API error must not silently stop all trading.
+                current_regime = regime_ctx.get("regime", "unknown")
                 strategy = STRATEGIES.get(self.cfg.strategy)
                 if (strategy and strategy.compatible_regimes is not None
                         and current_regime != "unknown"):
@@ -197,6 +231,11 @@ class TradeBrainAgent:
                 else:
                     for symbol in self.watchlist:
                         await self._evaluate_guarded(symbol, regime_ctx, fng)
+
+                logger.info(
+                    f"Tick complete: {len(self.watchlist)} symbol(s) scanned, "
+                    f"regime={current_regime}, took {time.monotonic() - tick_started:.1f}s"
+                )
 
                 await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
             except asyncio.TimeoutError:

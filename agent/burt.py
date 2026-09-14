@@ -233,6 +233,17 @@ class Burt:
         self._products_cache: list[Any] = []
         self._products_cache_at: float = 0.0
         self._last_user_msg: str = ""
+        # discord.py dispatches on_message as a fresh task per event, so two
+        # messages arriving within one LLM round-trip (e.g. "adjust the
+        # settings" followed seconds later by an impatient "Burt?") run
+        # _on_message concurrently. Each call independently hits the LLM and
+        # independently mutates shared config (set_config_key), so the two
+        # responses can race and leave the account on a config neither
+        # response actually described (observed 2026-09-12: two replies at
+        # the same millisecond, final strategy/min_confidence matched neither
+        # one). Serializing on this lock makes messages a real conversation
+        # turn-by-turn instead of a race.
+        self._msg_lock = asyncio.Lock()
 
         if not _has_discord:
             logger.warning("discord.py not installed — Burt disabled")
@@ -310,18 +321,21 @@ class Burt:
         except Exception as exc:
             logger.warning(f"Failed to store Discord message: {exc}")
 
-        # Generate response
-        try:
-            response = await self._generate_response(message.content)
-            await message.channel.send(response)
-            await self.db.add_discord_message(
-                role="assistant",
-                content=response,
-                discord_user="Burt",
-                message_id="",
-            )
-        except Exception as exc:
-            logger.error(f"Burt response failed: {exc}")
+        # Serialize generation + config mutation — see _msg_lock comment in
+        # __init__. A message that arrives mid-response now waits its turn
+        # instead of racing the in-flight one.
+        async with self._msg_lock:
+            try:
+                response = await self._generate_response(message.content)
+                await message.channel.send(response)
+                await self.db.add_discord_message(
+                    role="assistant",
+                    content=response,
+                    discord_user="Burt",
+                    message_id="",
+                )
+            except Exception as exc:
+                logger.error(f"Burt response failed: {exc}")
 
     # ------------------------------------------------------------------
     # Response generation
