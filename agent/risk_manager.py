@@ -307,13 +307,21 @@ class RiskManager:
             logger.warning(f"Balance sync failed — keeping ${self.state.balance_usdc:,.2f}: {exc}")
 
     async def sync(self) -> None:
-        """Called at top of each signal loop iteration."""
-        from agent.database import get_db
+        """Called at top of each signal loop iteration, right after
+        db.sync_config() — which already did ONE query to pull every row out
+        of agent_config into the shared config singleton (self.cfg is that
+        same object, not a copy). This used to re-fetch each of these 9 keys
+        with its own separate `SELECT ... WHERE key = $1` — 9 extra pool
+        round-trips every tick for data already sitting in self.cfg. On Neon
+        that was regularly enough to blow the 45s tick-step watchdog (2026-09-14
+        log: 'risk.sync' timed out on ~40% of ticks), eating away the interval
+        between symbol scans. Read the already-synced singleton instead.
+        """
         await self._sync_balance()
-        # DB key → RiskParams field. Several params have a `_pct` suffix on the
-        # state object that the DB key omits — map them explicitly so the UI
-        # actually moves the right knob.
-        key_to_field = {
+        # cfg attr → RiskParams field. Several params have a `_pct` suffix on
+        # the state object that the cfg attr omits — map them explicitly so
+        # the UI actually moves the right knob.
+        attr_to_field = {
             "leverage": "leverage",
             "risk_per_trade": "risk_per_trade_pct",
             "daily_loss_limit": "daily_loss_limit_pct",
@@ -324,14 +332,10 @@ class RiskManager:
             "min_confidence": "min_confidence",
             "paper_balance": "balance_usdc",
         }
-        try:
-            db = await get_db()
-            for key, field_name in key_to_field.items():
-                val = await db.get_config_value(key)
-                if val is not None:
-                    setattr(self.state, field_name, self._coerce(key, val))
-        except Exception as exc:
-            logger.warning(f"RiskManager sync failed: {exc}")
+        for attr, field_name in attr_to_field.items():
+            val = getattr(self.cfg, attr, None)
+            if val is not None:
+                setattr(self.state, field_name, val)
 
         # Midnight UTC circuit breaker reset
         current_day = int(time.time() / 86400)
@@ -340,16 +344,6 @@ class RiskManager:
             self.state.circuit_breaker_active = False
             self._last_reset_day = current_day
             logger.info("Circuit breaker auto-reset (midnight UTC)")
-
-    @staticmethod
-    def _coerce(key: str, val: str) -> Any:
-        if key in ("leverage",):
-            return int(val)
-        if key in ("risk_per_trade", "daily_loss_limit", "atr_multiplier",
-                   "take_profit_rr", "min_confidence", "fixed_stop_pct",
-                   "paper_balance"):
-            return float(val)
-        return val
 
     # ------------------------------------------------------------------
     # Pre-trade checks
