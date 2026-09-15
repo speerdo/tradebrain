@@ -175,6 +175,29 @@ class TradeBrainAgent:
             )
             return default
 
+    # Floor guarantee: "at least one trade per 24h" is a hard requirement, not
+    # an aspiration. Under the single configured strategy, most ticks resolve
+    # to "No directional signal" by design (donchian_breakout requires an
+    # actual 20-bar breakout — rare by construction) which is fine on average
+    # but gives no floor. If nothing has traded in _DROUGHT_HOURS, broaden to
+    # every OTHER strategy that's still compatible with the current regime
+    # (each already self-declares its regime fit — chop-only bollinger never
+    # runs in a trend regime and vice versa) instead of relying on just one.
+    # Scoped to the drought window only, so normal-day LLM cost is unchanged.
+    _DROUGHT_HOURS = 20.0
+
+    async def _last_trade_age_hours(self) -> float:
+        try:
+            val = await self.db.fetchval(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) / 3600.0 "
+                "FROM trades WHERE is_paper = $1",
+                self.cfg.paper_trading,
+            )
+            return float(val) if val is not None else 999.0
+        except Exception as exc:
+            logger.warning(f"Drought check failed: {exc}")
+            return 0.0  # fail closed — don't broaden strategy selection on a DB hiccup
+
     async def _loop(self) -> None:
         screener_counter = 0
 
@@ -213,24 +236,39 @@ class TradeBrainAgent:
                     "sentiment.get_fear_greed", self.sentiment.get_fear_greed(), default={}
                 )
 
-                # Regime gate: skip strategy if it's not compatible with the current
-                # regime. "unknown" (regime fetch failed) fails OPEN — a transient
+                # Regime gate: only strategies compatible with the current regime
+                # run. "unknown" (regime fetch failed) fails OPEN — a transient
                 # API error must not silently stop all trading.
                 current_regime = regime_ctx.get("regime", "unknown")
-                strategy = STRATEGIES.get(self.cfg.strategy)
-                if (strategy and strategy.compatible_regimes is not None
-                        and current_regime != "unknown"):
-                    if current_regime not in strategy.compatible_regimes:
-                        logger.info(
-                            f"Regime gate: strategy '{strategy.name}' disabled in "
-                            f"'{current_regime}' regime (compatible: {strategy.compatible_regimes})"
+
+                def _regime_ok(s) -> bool:
+                    return (s.compatible_regimes is None or current_regime == "unknown"
+                            or current_regime in s.compatible_regimes)
+
+                primary = STRATEGIES.get(self.cfg.strategy)
+                candidates = [primary] if primary and _regime_ok(primary) else []
+
+                drought_hours = await self._tick_step(
+                    "drought_check", self._last_trade_age_hours(), default=0.0
+                )
+                if drought_hours >= self._DROUGHT_HOURS:
+                    fallback = [s for s in STRATEGIES.values()
+                                if s not in candidates and _regime_ok(s)]
+                    if fallback:
+                        logger.warning(
+                            f"Drought guard: {drought_hours:.1f}h since last trade "
+                            f"(≥{self._DROUGHT_HOURS}h) — also trying "
+                            f"{[s.name for s in fallback]} this tick"
                         )
-                    else:
-                        for symbol in self.watchlist:
-                            await self._evaluate_guarded(symbol, regime_ctx, fng)
+                        candidates += fallback
+
+                if not candidates:
+                    logger.info(
+                        f"Regime gate: no strategy compatible with '{current_regime}' regime"
+                    )
                 else:
                     for symbol in self.watchlist:
-                        await self._evaluate_guarded(symbol, regime_ctx, fng)
+                        await self._evaluate_guarded(symbol, candidates, regime_ctx, fng)
 
                 logger.info(
                     f"Tick complete: {len(self.watchlist)} symbol(s) scanned, "
@@ -253,11 +291,12 @@ class TradeBrainAgent:
     # guarantees the loop always moves on to the next symbol/tick.
     _EVALUATE_TIMEOUT_SEC = 180
 
-    async def _evaluate_guarded(self, product_id: str, regime_ctx: dict | None = None,
+    async def _evaluate_guarded(self, product_id: str, strategies: list,
+                                 regime_ctx: dict | None = None,
                                  fng: dict | None = None) -> None:
         try:
             await asyncio.wait_for(
-                self._evaluate(product_id, regime_ctx, fng),
+                self._evaluate(product_id, strategies, regime_ctx, fng),
                 timeout=self._EVALUATE_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
@@ -266,9 +305,18 @@ class TradeBrainAgent:
                 f"{self._EVALUATE_TIMEOUT_SEC}s — abandoning and moving on"
             )
 
-    async def _evaluate(self, product_id: str, regime_ctx: dict | None = None,
+    # Skip reasons that mean "this particular signal wasn't good enough" —
+    # worth retrying with the next candidate strategy. Everything else
+    # (cooldowns, circuit breaker, portfolio caps) is symbol/account-level
+    # and would fail identically for every strategy, so it stops the loop.
+    _RETRYABLE_SKIP_PREFIXES = ("No directional signal", "Confidence ")
+
+    async def _evaluate(self, product_id: str, strategies: list,
+                        regime_ctx: dict | None = None,
                         fng: dict | None = None) -> None:
         if self.executor.has_position(product_id):
+            return
+        if not strategies:
             return
 
         signal = type("Sig", (), {"direction": "none", "confidence": 0.0})()
@@ -295,11 +343,8 @@ class TradeBrainAgent:
                 df_4h = aggregate_candles(df_2h, factor=2)
                 indicators["4h"] = compute_4h_indicators(df_4h)
 
-            strategy = STRATEGIES.get(self.cfg.strategy)
-            if not strategy:
-                return
-
-            # C3: Fetch derivatives context (funding + OI deltas)
+            # C3: Fetch derivatives context (funding + OI deltas) — symbol-level,
+            # shared across every candidate strategy this tick.
             deriv_ctx = await self.derivatives.get_context(product_id)
 
             # C4: Fetch news for this symbol (best-effort, may be empty)
@@ -315,83 +360,88 @@ class TradeBrainAgent:
                 extra_parts.append(self.sentiment.format_prompt_block(fng, news, currency))
             extra_context = "".join(extra_parts)
 
-            sig = await self.signal_engine.evaluate(
-                product_id, strategy, indicators,
-                regime=regime_ctx,
-                extra_context=extra_context,
-            )
-            open_positions = self.executor.get_open_positions()
-            skip = self.risk.check_trade_allowed(sig, product_id, open_positions)
-            if skip:
-                logger.info(f"Skip {product_id}: {skip}")
-                return
-
-            # C3: Server-side funding-cost rule
-            if deriv_ctx:
-                fund_skip = self.derivatives.check_funding_rule(sig.direction, deriv_ctx)
-                if fund_skip:
-                    logger.info(f"Skip {product_id}: {fund_skip}")
-                    return
-
-            # C4: News veto — skip entries during high-panic news for this asset
+            # C4: News veto applies to the symbol regardless of strategy —
+            # check once up front rather than per candidate.
             if news and self.sentiment.has_high_panic_news(news):
                 logger.info(f"Skip {product_id}: high-panic news veto")
                 return
 
-            # Per-symbol trend filter (log-driven, 2026-09-01..10): every
-            # NEAR/HYPE/LINK loss was a long entered while price sat below
-            # its 1h EMA50 — the global regime gate says nothing about an
-            # individual symbol's trend. Mechanically block counter-trend
-            # entries; the signal's entry_price may be a level the LLM wants
-            # to see filled, so compare the CURRENT price instead.
-            i_1h = indicators.get("1h", {})
-            trend_price = i_1h.get("price")
-            trend_ema = i_1h.get("ema50")
-            if trend_price and trend_ema:
-                if sig.direction == "long" and trend_price < trend_ema:
-                    logger.info(
-                        f"Skip {product_id}: trend filter — long blocked, "
-                        f"1h price {trend_price:.4f} < EMA50 {trend_ema:.4f}"
-                    )
-                    return
-                if sig.direction == "short" and trend_price > trend_ema:
-                    logger.info(
-                        f"Skip {product_id}: trend filter — short blocked, "
-                        f"1h price {trend_price:.4f} > EMA50 {trend_ema:.4f}"
-                    )
+            for strategy in strategies:
+                sig = await self.signal_engine.evaluate(
+                    product_id, strategy, indicators,
+                    regime=regime_ctx,
+                    extra_context=extra_context,
+                )
+                open_positions = self.executor.get_open_positions()
+                skip = self.risk.check_trade_allowed(sig, product_id, open_positions)
+                if skip:
+                    logger.info(f"Skip {product_id} [{strategy.name}]: {skip}")
+                    if skip.startswith(self._RETRYABLE_SKIP_PREFIXES):
+                        continue
                     return
 
-            entry = sig.entry_price or indicators["15m"]["price"]
-            sl, tp, notional, margin, risk_usdc = self.risk.calculate_trade_params(
-                sig.direction, entry, indicators["15m"]["atr"]
-            )
-            if notional <= 0 or margin <= 0:
-                return
+                # C3: Server-side funding-cost rule
+                if deriv_ctx:
+                    fund_skip = self.derivatives.check_funding_rule(sig.direction, deriv_ctx)
+                    if fund_skip:
+                        logger.info(f"Skip {product_id} [{strategy.name}]: {fund_skip}")
+                        continue
 
-            result = await self.executor.enter_position(
-                symbol=product_id,
-                display_name=self.screener.display_names.get(product_id, product_id),
-                direction=sig.direction,
-                entry_price=entry,
-                stop_loss=sl,
-                take_profit=tp,
-                size_usdc=notional,
-                margin_usdc=margin,
-                leverage=self.risk.state.leverage,
-                risk_usdc=risk_usdc,
-                strategy=strategy.name,
-                confidence=sig.confidence,
-                reasoning=sig.reasoning,
-            )
-            if result.success:
-                self.risk.protections.record_entry()
-                # get_position only tracks paper positions — None in live mode
-                pos = self.executor.get_position(product_id)
-                if pos is not None:
-                    self.monitor.record_entry(pos, indicators["15m"]["atr"])
-                logger.info(f"✅ Position opened: {product_id} {sig.direction}")
-            else:
-                logger.warning(f"Failed to open {product_id}: {result.error}")
+                # Per-symbol trend filter (log-driven, 2026-09-01..10): every
+                # NEAR/HYPE/LINK loss was a long entered while price sat below
+                # its 1h EMA50 — the global regime gate says nothing about an
+                # individual symbol's trend. Mechanically block counter-trend
+                # entries; the signal's entry_price may be a level the LLM wants
+                # to see filled, so compare the CURRENT price instead.
+                i_1h = indicators.get("1h", {})
+                trend_price = i_1h.get("price")
+                trend_ema = i_1h.get("ema50")
+                if trend_price and trend_ema:
+                    if sig.direction == "long" and trend_price < trend_ema:
+                        logger.info(
+                            f"Skip {product_id} [{strategy.name}]: trend filter — long "
+                            f"blocked, 1h price {trend_price:.4f} < EMA50 {trend_ema:.4f}"
+                        )
+                        continue
+                    if sig.direction == "short" and trend_price > trend_ema:
+                        logger.info(
+                            f"Skip {product_id} [{strategy.name}]: trend filter — short "
+                            f"blocked, 1h price {trend_price:.4f} > EMA50 {trend_ema:.4f}"
+                        )
+                        continue
+
+                entry = sig.entry_price or indicators["15m"]["price"]
+                sl, tp, notional, margin, risk_usdc = self.risk.calculate_trade_params(
+                    sig.direction, entry, indicators["15m"]["atr"]
+                )
+                if notional <= 0 or margin <= 0:
+                    continue
+
+                result = await self.executor.enter_position(
+                    symbol=product_id,
+                    display_name=self.screener.display_names.get(product_id, product_id),
+                    direction=sig.direction,
+                    entry_price=entry,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    size_usdc=notional,
+                    margin_usdc=margin,
+                    leverage=self.risk.state.leverage,
+                    risk_usdc=risk_usdc,
+                    strategy=strategy.name,
+                    confidence=sig.confidence,
+                    reasoning=sig.reasoning,
+                )
+                if result.success:
+                    self.risk.protections.record_entry()
+                    # get_position only tracks paper positions — None in live mode
+                    pos = self.executor.get_position(product_id)
+                    if pos is not None:
+                        self.monitor.record_entry(pos, indicators["15m"]["atr"])
+                    logger.info(f"✅ Position opened: {product_id} {sig.direction} [{strategy.name}]")
+                else:
+                    logger.warning(f"Failed to open {product_id} [{strategy.name}]: {result.error}")
+                return  # entry attempted (success or hard failure) — done with this symbol
 
         except Exception as exc:
             logger.error(f"Error evaluating {product_id}: {exc}")

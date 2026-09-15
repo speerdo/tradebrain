@@ -18,9 +18,11 @@ async def test():
     await agent.db.sync_config()
     await agent.risk.sync()
     
+    from strategies import STRATEGIES
+    strategy = STRATEGIES.get(agent.cfg.strategy)
     for symbol in agent.watchlist[:2]:  # Test first 2 only
         print(f"\nEvaluating {symbol}...")
-        await agent._evaluate(symbol)
+        await agent._evaluate(symbol, [strategy] if strategy else [])
     
     print("\n=== Iteration complete ===")
     
