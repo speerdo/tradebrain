@@ -80,7 +80,13 @@ class Config(BaseModel):
     screener_interval_h: float = Field(default=1.0)
     min_confidence: float = Field(default=0.65)
     atr_multiplier: float = Field(default=1.5)
-    take_profit_rr: float = Field(default=2.0)
+    # 2026-09-16: raised 2.0 -> 3.0. The fixed TP is mostly a cap — the
+    # trailing stop (position_monitor.TRAILING_ACTIVATE_R) usually decides the
+    # real exit on a genuine trend — but a nearer fixed target caps upside on
+    # trades that jump straight through 1.5-2R without ever pulling back far
+    # enough to trail. A higher target gives those the room to actually pay
+    # for the two round-trip fees plus the trades that wash out at breakeven.
+    take_profit_rr: float = Field(default=3.0)
     fixed_stop_pct: float = Field(default=0.02)
     stop_loss_method: str = Field(default="atr")
     # Paper-mode account size. RiskManager sizes every position and sets the

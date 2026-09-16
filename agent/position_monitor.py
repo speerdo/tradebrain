@@ -6,7 +6,8 @@ Checks every 30 seconds:
 - Live positions: sync with /cfm/positions
 
 Exit management (B2):
-- Breakeven move: at +1R, move stop to entry (+fees)
+- Breakeven move: at +1.5R (same trigger as the partial), move stop to
+  entry (+fees) on the remaining size
 - Trailing stop: after +1.5R, trail by ATR × multiplier; ratchets toward profit
 - Time-based exit: positions open > max_hold_h get closed IF not yet in
   meaningful profit (< +0.5R) — winners run on their trailed stop
@@ -28,7 +29,18 @@ import config
 
 
 # Exit management defaults (live-tunable via config if desired)
-BREAKEVEN_AT_R = 1.0
+# BREAKEVEN_AT_R used to fire at +1.0R — a full half-R before the partial's
+# +1.5R. That meant a trade only had to tag +1R once (routine noise, not a
+# real move) to get its stop yanked all the way up to flat, with zero profit
+# banked yet. 2026-09-16 (NEAR PERP, trade #20): 40 minutes grinding to
+# +$2.12 (~1.01R) tripped breakeven, then a normal pullback round-tripped it
+# to a dead-flat $0.00 close after fees — never got a chance at the +1.5R
+# partial. Aligning breakeven with the partial means a trade that reverses
+# before +1.5R rides its ORIGINAL stop (a real, but bounded, -1R loss) instead
+# of being guaranteed a wash; a trade that reaches +1.5R banks 30% AND arms
+# breakeven on the runner in the same tick, which is the outcome that
+# actually justifies paying the round-trip fee twice.
+BREAKEVEN_AT_R = 1.5
 TRAILING_ACTIVATE_R = 1.5
 TRAILING_ATR_MULT = 2.0
 MAX_HOLD_H = 12.0
