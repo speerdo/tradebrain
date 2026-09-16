@@ -257,9 +257,17 @@ class PositionMonitor:
                     pos.stop_loss = new_stop
                     logger.info(f"📉 {pos.display_name} BE stop → {new_stop:.2f} (fee buffer ${fee_buffer_usdc:.2f})")
 
-        # Trailing stop: after +1.5R, trail by ATR × mult
+        # Trailing stop: after +1.5R, trail by ATR × mult, but never looser
+        # than the position's own original stop distance. TRAILING_ATR_MULT
+        # (2.0) is wider than the default atr_multiplier (1.5) used to set
+        # the initial stop, so an uncapped trail could give back MORE than
+        # the trade's entire planned risk before firing — a runner at +1.9R
+        # (NEAR PERP, trade #21, 2026-09-16) round-tripped to +0.3R because
+        # the trail sat 2.0×ATR behind price while the trade was only ever
+        # risking 1.5×ATR. Capping at stop_distance keeps the trail at least
+        # as tight as the trade's own risk once it's protecting gains.
         if r_mult >= TRAILING_ACTIVATE_R and atr > 0:
-            trail_dist = atr * TRAILING_ATR_MULT
+            trail_dist = min(atr * TRAILING_ATR_MULT, stop_distance)
             if pos.direction == "long":
                 new_stop = price - trail_dist
                 if new_stop > pos.stop_loss:

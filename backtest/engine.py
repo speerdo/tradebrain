@@ -402,9 +402,12 @@ class BacktestEngine:
                 if new_stop < t.stop_loss:
                     t.stop_loss = new_stop
 
-        # Trailing stop
+        # Trailing stop — capped at the position's own stop_distance so it can
+        # never be looser than the trade's original risk once active (mirrors
+        # the same fix in agent/position_monitor.py; a backtester that doesn't
+        # replicate a live fix isn't evidence about live behavior anymore).
         if self.cfg.enable_trailing and r_multiple >= self.cfg.trailing_activate_r and op.atr_at_entry > 0:
-            trail_dist = op.atr_at_entry * self.cfg.trailing_atr_mult
+            trail_dist = min(op.atr_at_entry * self.cfg.trailing_atr_mult, op.stop_distance)
             if t.direction == "long":
                 new_stop = current_price - trail_dist
                 if new_stop > t.stop_loss:

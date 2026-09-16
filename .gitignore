@@ -64,4 +64,7 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 
+# ---- Backtest candle cache ----
+backtest_cache/
+
 .sf
