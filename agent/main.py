@@ -188,7 +188,8 @@ class TradeBrainAgent:
     # (each already self-declares its regime fit — chop-only bollinger never
     # runs in a trend regime and vice versa) instead of relying on just one.
     # Scoped to the drought window only, so normal-day LLM cost is unchanged.
-    _DROUGHT_HOURS = 20.0
+    # Threshold comes from config.drought_guard_hours (hot-reloadable);
+    # 0 disables the guard entirely.
 
     async def _last_trade_age_hours(self) -> float:
         try:
@@ -252,19 +253,21 @@ class TradeBrainAgent:
                 primary = STRATEGIES.get(self.cfg.strategy)
                 candidates = [primary] if primary and _regime_ok(primary) else []
 
-                drought_hours = await self._tick_step(
-                    "drought_check", self._last_trade_age_hours(), default=0.0
-                )
-                if drought_hours >= self._DROUGHT_HOURS:
-                    fallback = [s for s in STRATEGIES.values()
-                                if s not in candidates and _regime_ok(s)]
-                    if fallback:
-                        logger.warning(
-                            f"Drought guard: {drought_hours:.1f}h since last trade "
-                            f"(≥{self._DROUGHT_HOURS}h) — also trying "
-                            f"{[s.name for s in fallback]} this tick"
-                        )
-                        candidates += fallback
+                drought_limit = float(self.cfg.drought_guard_hours or 0)
+                if drought_limit > 0:
+                    drought_hours = await self._tick_step(
+                        "drought_check", self._last_trade_age_hours(), default=0.0
+                    )
+                    if drought_hours >= drought_limit:
+                        fallback = [s for s in STRATEGIES.values()
+                                    if s not in candidates and _regime_ok(s)]
+                        if fallback:
+                            logger.warning(
+                                f"Drought guard: {drought_hours:.1f}h since last trade "
+                                f"(≥{drought_limit}h) — also trying "
+                                f"{[s.name for s in fallback]} this tick"
+                            )
+                            candidates += fallback
 
                 if not candidates:
                     logger.info(

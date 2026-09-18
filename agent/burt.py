@@ -47,6 +47,7 @@ TUNABLE_CONFIG: dict[str, dict] = {
     "max_risk_per_trade": {"type": "float", "min": 0.01, "max": 0.10},
     "max_margin_pct":     {"type": "float", "min": 0.10, "max": 0.90},
     "require_4h_bias":    {"type": "enum",  "choices": ["true", "false"]},
+    "drought_guard_hours": {"type": "float", "min": 0.0, "max": 72.0},
 }
 
 TOOLS = [

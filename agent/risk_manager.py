@@ -27,6 +27,7 @@ class RiskParams:
     # Whole-contract sizing ceilings (config.max_risk_per_trade / max_margin_pct)
     max_risk_per_trade_pct: float = 0.04
     max_margin_pct: float = 0.50
+    min_stop_pct: float = 0.015
     circuit_breaker_active: bool = False
     daily_loss_usdc: float = 0.0
     manual_pause: bool = False
@@ -201,14 +202,19 @@ def compute_stops(entry_price: float, atr: float | None,
                   atr_mult: float = 1.5,
                   method: str = "atr",
                   rr: float = 2.0,
-                  direction: str = "long") -> tuple[float, float]:
+                  direction: str = "long",
+                  min_stop_pct: float = 0.0) -> tuple[float, float]:
     """
     Returns (stop_loss_price, take_profit_price).
+
+    `min_stop_pct` floors the stop distance (fraction of entry) — an ATR
+    stop in a quiet market can land inside the fee's reach.
     """
     if method == "atr" and atr is not None and atr > 0:
         stop_distance = atr * atr_mult
     else:
         stop_distance = entry_price * fixed_pct
+    stop_distance = max(stop_distance, entry_price * min_stop_pct)
 
     if direction == "long":
         sl = entry_price - stop_distance
@@ -428,6 +434,7 @@ class RiskManager:
             "min_confidence": "min_confidence",
             "max_risk_per_trade": "max_risk_per_trade_pct",
             "max_margin_pct": "max_margin_pct",
+            "min_stop_pct": "min_stop_pct",
         }
         if self.cfg.paper_trading:
             attr_to_field["paper_balance"] = "balance_usdc"
@@ -617,6 +624,7 @@ class RiskManager:
             method=self.state.stop_loss_method,
             rr=self.state.take_profit_rr,
             direction=direction,
+            min_stop_pct=self.state.min_stop_pct,
         )
         # Drawdown-scaled sizing (B3): reduce risk-per-trade in losing streaks
         scaled_risk = self.state.risk_per_trade_pct * self.get_drawdown_scale()

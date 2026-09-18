@@ -92,6 +92,12 @@ class Config(BaseModel):
     # nearly irrelevant to expectancy (slightly better the higher it is).
     # 5R leaves room for the rare trade that runs straight through.
     take_profit_rr: float = Field(default=5.0)
+    # Floor on stop distance as a fraction of entry. With the 0.28% round-trip
+    # fee, fee/risk = 0.28% / stop%, so a stop under ~1.4% can't clear the
+    # 20% entry fee budget no matter how the position is sized (ETH's 3x ATR
+    # stop was 1.21% on 2026-09-18 and got rejected). 1.5% -> fee is 19% of
+    # risk; it also means "deeper stops" holds even when ATR is compressed.
+    min_stop_pct: float = Field(default=0.015)
     fixed_stop_pct: float = Field(default=0.02)
     stop_loss_method: str = Field(default="atr")
     # Paper-mode account size. RiskManager sizes every position and sets the
@@ -133,6 +139,11 @@ class Config(BaseModel):
     max_margin_pct: float = Field(default=0.50)
     # Mechanical 4h-bias gate (long only above 4h EMA50, short only below).
     require_4h_bias: bool = Field(default=True)
+    # Drought guard: if nothing has traded in this many hours, also try every
+    # other regime-compatible strategy each tick. 0 disables it. Off by
+    # default since 2026-09-18 — forced trades cost expectancy, and every
+    # strategy it would fall back to backtests worse than the primary.
+    drought_guard_hours: float = Field(default=0.0)
     # Partial take-profit adds a third fee leg. Skip it when that leg's fee
     # would eat more than this fraction of the trade's $-at-risk (risk_usdc) —
     # otherwise the "diversification" of banking early costs more than it's
@@ -321,6 +332,8 @@ def _build_config() -> Config:
         max_risk_per_trade=_float("MAX_RISK_PER_TRADE", 0.04),
         max_margin_pct=_float("MAX_MARGIN_PCT", 0.50),
         require_4h_bias=_bool("REQUIRE_4H_BIAS", True),
+        drought_guard_hours=_float("DROUGHT_GUARD_HOURS", 0.0),
+        min_stop_pct=_float("MIN_STOP_PCT", 0.015),
         fee_budget_pct_of_risk=_float("FEE_BUDGET_PCT_OF_RISK", 0.15),
         entry_fee_budget_pct_of_risk=_float("ENTRY_FEE_BUDGET_PCT_OF_RISK", 0.20),
         signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),

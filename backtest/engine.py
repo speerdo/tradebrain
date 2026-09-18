@@ -36,6 +36,7 @@ class BacktestConfig:
     risk_per_trade_pct: float = 0.01
     atr_multiplier: float = 3.0          # mirrors config default (2026-09-18 sweep)
     take_profit_rr: float = 5.0
+    min_stop_pct: float = 0.015          # mirrors config.min_stop_pct
     fixed_stop_pct: float = 0.02
     stop_loss_method: str = "atr"
     # 0.65 mirrors the live min_confidence gate: check_entry() scores weak
@@ -348,6 +349,7 @@ class BacktestEngine:
                                 method=self.cfg.stop_loss_method,
                                 rr=self.cfg.take_profit_rr,
                                 direction=sig.direction,
+                                min_stop_pct=self.cfg.min_stop_pct,
                             )
                             notional, margin, risk = compute_position_size(
                                 entry, sl, balance,

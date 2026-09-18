@@ -59,9 +59,12 @@ async def main() -> int:
         cfm = float((summary.get("cfm_usd_balance") or {}).get("value") or 0)
         bp = float((summary.get("futures_buying_power") or {}).get("value") or 0)
         print(f"  CFM balance: ${cfm:,.2f}   futures buying power: ${bp:,.2f}")
-        balance = args.balance or cfm or float(cfg.paper_balance)
-        if cfm <= 0:
-            problems.append("CFM balance is $0 — sweep funds from spot to futures before going live")
+        # Buying power is what the exchange will let us margin against — USD
+        # held in the spot account counts (it is swept on demand), so a $0
+        # CFM balance with buying power is funded, not empty.
+        balance = args.balance or bp or cfm or float(cfg.paper_balance)
+        if bp <= 0:
+            problems.append("Futures buying power is $0 — deposit USD before going live")
         print(f"  Evaluating sizing for a ${balance:,.2f} account "
               f"(risk/trade {cfg.risk_per_trade:.1%}, hard max {cfg.max_risk_per_trade:.0%}, "
               f"margin cap {cfg.max_margin_pct:.0%}, ATR stop x{cfg.atr_multiplier})")
@@ -86,7 +89,7 @@ async def main() -> int:
                 a = float(atr_series(df["high"], df["low"], df["close"]).iloc[-1])
                 stop_pct = a * cfg.atr_multiplier / px
             spec = ContractSpec(cs, p.margin_rate_long, p.margin_rate_short)
-            sp = stop_pct or 0.02
+            sp = max(stop_pct or 0.02, cfg.min_stop_pct)
             sizing = compute_contract_position(
                 px, px * (1 - sp), "long", balance, cfg.risk_per_trade, spec,
                 cfg.max_risk_per_trade, cfg.max_margin_pct,
