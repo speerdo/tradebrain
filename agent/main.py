@@ -29,6 +29,7 @@ from agent.database import get_db
 from agent.derivatives import DerivativesContext
 from agent.executor import Executor
 from agent.indicator_engine import compute_indicators, compute_4h_indicators, aggregate_candles
+from agent.maintenance import MaintenanceWindow
 from agent.memory_engine import MemoryEngine
 from agent.notifier import Notifier
 from agent.position_monitor import PositionMonitor
@@ -48,7 +49,10 @@ class TradeBrainAgent:
         self.cb = CoinbaseClient()
         self.executor = Executor(self.cb)
         self.risk = RiskManager()
-        self.screener = Screener(self.cb)
+        # The screener needs the balance to drop products whose single
+        # contract can't be afforded (whole-contract CFM sizing).
+        self.screener = Screener(self.cb, risk=self.risk)
+        self.maintenance = MaintenanceWindow()
         self.signal_engine = SignalEngine()
         self.regime_engine = RegimeEngine(self.cb)
         self.memory_engine = MemoryEngine(self.signal_engine)
@@ -266,6 +270,11 @@ class TradeBrainAgent:
                     logger.info(
                         f"Regime gate: no strategy compatible with '{current_regime}' regime"
                     )
+                elif not self.maintenance.is_open():
+                    # Fri 5-6pm ET: CFM is closed. Documented in
+                    # FCM_TRADING_HOURS.md as wired here, but never was — a
+                    # live entry attempt in the window just errors out.
+                    logger.info("Maintenance window — no entries this tick")
                 else:
                     for symbol in self.watchlist:
                         await self._evaluate_guarded(symbol, candidates, regime_ctx, fng)
@@ -410,11 +419,34 @@ class TradeBrainAgent:
                         )
                         continue
 
+                # Hard 4h-bias gate. Every prompt's decision tree starts with
+                # "4H bias must agree — SKIP otherwise", but only the 1h EMA50
+                # was enforced server-side; the LLM was free to ignore the
+                # 4h step. Backtested 2026-09-18 (see backtest/engine.py
+                # require_4h_bias) — enforce it mechanically.
+                i_4h = indicators.get("4h", {})
+                if self.cfg.require_4h_bias and i_4h.get("price_vs_ema50"):
+                    if sig.direction == "long" and i_4h["price_vs_ema50"] != "above":
+                        logger.info(f"Skip {product_id} [{strategy.name}]: 4h bias filter — long blocked, 4h below EMA50")
+                        continue
+                    if sig.direction == "short" and i_4h["price_vs_ema50"] != "below":
+                        logger.info(f"Skip {product_id} [{strategy.name}]: 4h bias filter — short blocked, 4h above EMA50")
+                        continue
+
                 entry = sig.entry_price or indicators["15m"]["price"]
-                sl, tp, notional, margin, risk_usdc = self.risk.calculate_trade_params(
-                    sig.direction, entry, indicators["15m"]["atr"]
+                spec = self.screener.specs.get(product_id)
+                if spec is None:
+                    # No contract economics for this product — refuse rather
+                    # than size continuously; the exchange fills whole
+                    # contracts and a continuous size is fiction in both modes.
+                    logger.warning(
+                        f"Skip {product_id} [{strategy.name}]: no contract spec from screener"
+                    )
+                    return
+                sl, tp, notional, margin, risk_usdc, contracts = self.risk.calculate_trade_params(
+                    sig.direction, entry, indicators["15m"]["atr"], spec=spec,
                 )
-                if notional <= 0 or margin <= 0:
+                if notional <= 0 or margin <= 0 or contracts < 1:
                     continue
 
                 result = await self.executor.enter_position(
@@ -431,6 +463,7 @@ class TradeBrainAgent:
                     strategy=strategy.name,
                     confidence=sig.confidence,
                     reasoning=sig.reasoning,
+                    contracts=contracts,
                 )
                 if result.success:
                     self.risk.protections.record_entry()

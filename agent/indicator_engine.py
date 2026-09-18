@@ -213,17 +213,34 @@ def compute_indicators_at(df_15m_full: pd.DataFrame, df_1h_full: pd.DataFrame,
     `i_15m` is the index into df_15m_full of the "current" 15m bar.
     `i_1h` is the index of the most recent CLOSED 1h bar as of that 15m bar.
     """
-    df_15m = df_15m_full.iloc[: i_15m + 1]
-    df_1h = df_1h_full.iloc[: i_1h + 1]
-    if df_15m.empty or df_1h.empty:
+    # Index the rows directly instead of slicing `iloc[:i+1]` and reading the
+    # tail: slicing copies the frame on every bar, which made a 180-day
+    # backtest O(n^2) (~60s per run) and a walk-forward grid impractical.
+    # Reading rows [i] and [i-1] is the same zero-look-ahead contract — the
+    # indicator columns were computed causally (rolling/ewm), so row i only
+    # depends on rows <= i.
+    if i_15m < 0 or i_1h < 0 or i_15m >= len(df_15m_full) or i_1h >= len(df_1h_full):
         return {}
 
-    last = df_15m.iloc[-1]
-    prev = df_15m.iloc[-2] if len(df_15m) > 1 else last
-    last_1h = df_1h.iloc[-1]
+    last = df_15m_full.iloc[i_15m]
+    prev = df_15m_full.iloc[i_15m - 1] if i_15m > 0 else last
+    last_1h = df_1h_full.iloc[i_1h]
+    return build_indicator_dict(last, prev, last_1h)
 
+
+def build_indicator_dict(last, prev, last_1h) -> dict:
+    """
+    Assemble the signal-engine indicator dict from three row-like objects
+    (pandas Series or plain dicts keyed by column name): the current 15m bar,
+    the previous 15m bar, and the most recent closed 1h bar.
+
+    Split out of `compute_indicators_at` so the backtester can feed it plain
+    dict rows (`df.to_dict("records")`) — pandas row access via `.iloc[i]` on
+    a mixed-dtype frame costs ~1ms per call, which was ~60% of a full
+    backtest's runtime.
+    """
     def _safe(val):
-        return None if pd.isna(val) else float(val)
+        return None if val is None or pd.isna(val) else float(val)
 
     return {
         "15m": {

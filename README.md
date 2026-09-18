@@ -71,12 +71,15 @@ Three built-in strategies provide signal prompts to the AI:
 
 ## Risk Management (Non-Negotiable)
 
-- **Position sizing**: At-risk dollars / stop distance, capped at 20% margin
-- **Stop loss**: ATR-based (default) or fixed % — placed simultaneously with entry
-- **Take profit**: Configurable R:R (default 2.0)
+- **Position sizing**: in **whole contracts** at the exchange's overnight margin rate (CFM fills whole contracts; 1 ETH PERP ≈ $260, 1 NEAR PERP ≈ $1,900). Target `risk_per_trade`, hard-capped by `max_risk_per_trade` (default 4%) and `max_margin_pct` (default 50% of balance for one position). Products whose single contract breaks either cap are dropped by the screener. Paper mode uses the same lot sizes so paper results mean something for live.
+- **Stop loss**: ATR-based (default 2.5× 15m ATR) or fixed % — placed simultaneously with entry, plus an exchange-native stop in live mode
+- **Take profit**: Configurable R:R (default 4.0); trailing stop takes over at +1.5R
+- **4h bias gate**: long only above the 4h EMA50, short only below (`require_4h_bias`)
 - **Circuit breaker**: Halts ALL trading after daily loss limit (default 5%)
-- **Leverage cap**: Default 3x, max 10x (FCM limit)
+- **Fees**: modeled at the measured 0.14%/fill taker rate; entries whose round-trip fee exceeds 20% of $-at-risk are rejected
 - **Min confidence**: default 0.65 to act on a signal — *tunable live from the UI or Burt*
+
+Before going live, run `venv/bin/python scripts/live_preflight.py` — it shows which products your balance can actually trade in whole contracts, what one loss costs, and previews (does not place) a 1-contract order to confirm fees and payload shape against the exchange.
 
 ## Quick Start
 

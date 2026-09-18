@@ -55,18 +55,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--strategy", default="rsi_macd", choices=list(STRATEGIES.keys()))
     p.add_argument("--symbol", default="BTC-PERP", help="Coinbase FCM product_id or alias")
     p.add_argument("--days", type=int, default=180)
-    p.add_argument("--balance", type=float, default=100_000.0)
-    p.add_argument("--leverage", type=int, default=3)
+    p.add_argument("--balance", type=float, default=1_000.0)
+    p.add_argument("--leverage", type=int, default=5)
     p.add_argument("--risk-per-trade", type=float, default=0.01)
-    p.add_argument("--atr-multiplier", type=float, default=1.5)
-    p.add_argument("--take-profit-rr", type=float, default=2.0)
-    p.add_argument("--min-confidence", type=float, default=0.0)
-    p.add_argument("--max-concurrent", type=int, default=3)
+    p.add_argument("--atr-multiplier", type=float, default=3.0)
+    p.add_argument("--take-profit-rr", type=float, default=5.0)
+    p.add_argument("--min-confidence", type=float, default=0.65)
+    p.add_argument("--max-concurrent", type=int, default=1)
     p.add_argument("--no-cache", action="store_true", help="Skip parquet cache")
     p.add_argument("--no-trailing", action="store_true")
     p.add_argument("--no-breakeven", action="store_true")
     p.add_argument("--no-time-exit", action="store_true")
-    p.add_argument("--no-partial-tp", action="store_true")
+    p.add_argument("--partial-tp", action="store_true", help="Enable the 30%%-at-1.5R partial (off by default, mirrors live)")
+    p.add_argument("--no-4h-bias", action="store_true", help="Disable the 4h EMA50 bias gate")
     p.add_argument("--trailing-mult", type=float, default=2.0)
     p.add_argument("--save-trades", type=str, default="", help="Path to save trades as JSON")
     return p.parse_args()
@@ -107,7 +108,8 @@ async def main() -> int:
             enable_trailing=not args.no_trailing,
             enable_breakeven=not args.no_breakeven,
             enable_time_exit=not args.no_time_exit,
-            enable_partial_tp=not args.no_partial_tp,
+            enable_partial_tp=args.partial_tp,
+            require_4h_bias=not args.no_4h_bias,
             trailing_atr_mult=args.trailing_mult,
         )
 

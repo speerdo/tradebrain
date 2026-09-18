@@ -79,14 +79,19 @@ class Config(BaseModel):
     # signal_interval, where every tick spends one LLM call per symbol.
     screener_interval_h: float = Field(default=1.0)
     min_confidence: float = Field(default=0.65)
-    atr_multiplier: float = Field(default=1.5)
-    # 2026-09-16: raised 2.0 -> 3.0. The fixed TP is mostly a cap — the
-    # trailing stop (position_monitor.TRAILING_ACTIVATE_R) usually decides the
-    # real exit on a genuine trend — but a nearer fixed target caps upside on
-    # trades that jump straight through 1.5-2R without ever pulling back far
-    # enough to trail. A higher target gives those the room to actually pay
-    # for the two round-trip fees plus the trades that wash out at breakeven.
-    take_profit_rr: float = Field(default=3.0)
+    # 2026-09-18: 1.5 -> 3.0. Sweep of 768 backtests (BTC/ETH/NEAR x
+    # donchian/rsi_macd, real 0.14% fees): expectancy improves MONOTONICALLY
+    # with stop width for both strategies (rsi_macd avgR -0.85 at 1.5x ->
+    # -0.35 at 3.0x; donchian -0.72 -> -0.45). A 1.5x 15m-ATR stop is
+    # routinely <1% away — inside normal noise, so ~80% of entries stopped
+    # out before the thesis could play. Wider stops also make the fixed
+    # 0.28% round-trip fee a smaller share of $-at-risk.
+    atr_multiplier: float = Field(default=3.0)
+    # 3.0 -> 5.0. The fixed target is mostly a cap — the trailing stop
+    # decides the real exit on a genuine trend — and the sweep found TP
+    # nearly irrelevant to expectancy (slightly better the higher it is).
+    # 5R leaves room for the rare trade that runs straight through.
+    take_profit_rr: float = Field(default=5.0)
     fixed_stop_pct: float = Field(default=0.02)
     stop_loss_method: str = Field(default="atr")
     # Paper-mode account size. RiskManager sizes every position and sets the
@@ -97,15 +102,37 @@ class Config(BaseModel):
     signal_model: str = Field(default="moonshotai/kimi-k2.6")
 
     # ------------------------------------------------------------------
-    # Trading fees — CFM nano perpetual-style futures are taker-only here
-    # (every entry/exit is a market order). Coinbase's published retail rate
-    # is 0.02% per fill with a $0.15 minimum per transaction; the minimum
-    # dominates at our position sizes ($120 notional), so every fill costs
-    # ~$0.15 regardless of the percentage. Two fills (entry+exit) per trade,
-    # three if a partial take-profit fires.
+    # Trading fees — CFM perpetual-style futures are taker-only here (every
+    # entry/exit is a market order). MEASURED 2026-09-18 via
+    # /orders/preview on this account: commission_total is 0.14% of notional
+    # on every product tried (1 ETH contract $262 -> $0.367; 1 BTC contract
+    # $811 -> $1.136; 1 NEAR contract $1,866 -> $2.614), with no per-fill
+    # minimum in play. The previous 0.02% + $0.15-minimum model under-
+    # charged every paper trade by ~2.5x at $200 notional. Two fills
+    # (entry+exit) per trade = 0.28% of notional round trip.
     # ------------------------------------------------------------------
-    taker_fee_pct: float = Field(default=0.0002)     # 0.02%
-    min_fee_usdc: float = Field(default=0.15)         # per-fill minimum
+    taker_fee_pct: float = Field(default=0.0014)     # 0.14% per fill (measured)
+    min_fee_usdc: float = Field(default=0.0)          # no minimum observed
+    # ------------------------------------------------------------------
+    # Whole-contract sizing. CFM products trade in whole contracts and the
+    # exchange charges margin at its own (overnight) rate — 24.5% on ETH,
+    # 38% on NEAR, 44% on DOT — regardless of the `leverage` knob. Sizing
+    # therefore works in contracts: how many whole contracts keep $-at-risk
+    # near risk_per_trade, subject to these two hard ceilings.
+    # ------------------------------------------------------------------
+    # A single contract is usually MORE than risk_per_trade wants at this
+    # account size. Allow rounding UP to 1 contract as long as the actual
+    # $-at-risk stays under this fraction of balance; otherwise skip.
+    # On $200, 1 ETH contract at a 2.5% stop risks $6.55 (3.3%) — 4% is the
+    # floor that leaves ETH tradeable at all; NEAR/SOL/XRP/BTC are out
+    # regardless ($12-$28 per contract at that stop).
+    max_risk_per_trade: float = Field(default=0.04)
+    # Exchange margin for one position may not exceed this fraction of
+    # balance. 1 ETH contract needs $64 (long) / $88 (short) on a $200
+    # account, so the old 20% cap made every product untradeable.
+    max_margin_pct: float = Field(default=0.50)
+    # Mechanical 4h-bias gate (long only above 4h EMA50, short only below).
+    require_4h_bias: bool = Field(default=True)
     # Partial take-profit adds a third fee leg. Skip it when that leg's fee
     # would eat more than this fraction of the trade's $-at-risk (risk_usdc) —
     # otherwise the "diversification" of banking early costs more than it's
@@ -119,7 +146,11 @@ class Config(BaseModel):
     # risk). Tightened 0.30→0.15 after the 2026-09-01..10 logs showed tiny-
     # risk trades slipping through ($0.17-$0.25 at-risk) whose full-size
     # wins capped at pocket change while losses still paid full fees.
-    entry_fee_budget_pct_of_risk: float = Field(default=0.15)
+    # 2026-09-18: with the measured 0.28% round-trip fee this ratio is purely
+    # a function of stop distance (0.28% / stop%): a 1.5% stop is 19%, 2%
+    # is 14%, 2.5% is 11%. 0.20 lets the wider ATR stops through and rejects
+    # anything tighter than ~1.4% — where the fee alone needs a +0.2R edge.
+    entry_fee_budget_pct_of_risk: float = Field(default=0.20)
 
     # ------------------------------------------------------------------
     # Run-plane model roles (MODELS.md §6, §7) — hot-reloadable
@@ -285,10 +316,13 @@ def _build_config() -> Config:
         # keeps its class default and every *_MODEL / *_PROVIDER in .env is
         # ignored no matter what .env.example documents.
         paper_balance=_float("PAPER_BALANCE", 200.0),
-        taker_fee_pct=_float("TAKER_FEE_PCT", 0.0002),
-        min_fee_usdc=_float("MIN_FEE_USDC", 0.15),
+        taker_fee_pct=_float("TAKER_FEE_PCT", 0.0014),
+        min_fee_usdc=_float("MIN_FEE_USDC", 0.0),
+        max_risk_per_trade=_float("MAX_RISK_PER_TRADE", 0.04),
+        max_margin_pct=_float("MAX_MARGIN_PCT", 0.50),
+        require_4h_bias=_bool("REQUIRE_4H_BIAS", True),
         fee_budget_pct_of_risk=_float("FEE_BUDGET_PCT_OF_RISK", 0.15),
-        entry_fee_budget_pct_of_risk=_float("ENTRY_FEE_BUDGET_PCT_OF_RISK", 0.15),
+        entry_fee_budget_pct_of_risk=_float("ENTRY_FEE_BUDGET_PCT_OF_RISK", 0.20),
         signal_model=_env("SIGNAL_MODEL", "moonshotai/kimi-k2.6"),
         critic_model=_env("CRITIC_MODEL"),
         burt_model=_env("BURT_MODEL"),

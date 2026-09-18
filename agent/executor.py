@@ -44,6 +44,10 @@ class PaperPosition:
     pnl_usdc: float = 0.0
     realized_partial: float = 0.0  # PnL already booked by partial take-profits
     fees_usdc: float = 0.0  # Cumulative taker fees across entry + partial + exit legs
+    # Whole contracts held (0 = sized continuously, pre-contract-aware rows).
+    # Paper tracks this too so partial closes round to whole contracts
+    # exactly as live must.
+    contracts: int = 0
     tax_treatment: str = "1256"
     product_type: str = "perp"
 
@@ -89,24 +93,25 @@ class Executor:
         margin_usdc: float, leverage: int, risk_usdc: float,
         strategy: str = "", confidence: float = 0.0, reasoning: str = "",
         display_name: str = "", product_type: str = "perp",
+        contracts: int = 0,
     ) -> OrderResult:
         if self.cfg.paper_trading:
             return await self._enter_paper(
                 symbol, display_name or symbol, direction, entry_price,
                 stop_loss, take_profit, size_usdc, margin_usdc, leverage,
-                risk_usdc, strategy, confidence, reasoning
+                risk_usdc, strategy, confidence, reasoning, contracts,
             )
         return await self._enter_live(
             symbol, display_name or symbol, direction, entry_price,
             stop_loss, take_profit, size_usdc, margin_usdc, leverage,
-            risk_usdc, strategy, confidence, reasoning,
+            risk_usdc, strategy, confidence, reasoning, contracts,
         )
 
     async def _enter_paper(self, product_id: str, display_name: str, direction: str,
                             entry_price: float, stop_loss: float, take_profit: float,
                             size_usdc: float, margin_usdc: float, leverage: int,
                             risk_usdc: float, strategy: str, confidence: float,
-                            reasoning: str) -> OrderResult:
+                            reasoning: str, contracts: int = 0) -> OrderResult:
         if product_id in self.paper_positions:
             return OrderResult(success=False, error=f"Already open: {product_id}")
         entry_fee = self.fee_for_leg(size_usdc)
@@ -116,11 +121,13 @@ class Executor:
             size_usdc=size_usdc, margin_usdc=margin_usdc, leverage=leverage,
             risk_usdc=risk_usdc, strategy=strategy, confidence=confidence,
             reasoning=reasoning, is_paper=True, fees_usdc=entry_fee,
+            contracts=contracts,
         )
         self.paper_positions[product_id] = pos
         logger.info(
             f"📄 PAPER ENTRY: {direction.upper()} {display_name} @ {entry_price:.2f} "
-            f"(entry fee ${entry_fee:.2f})"
+            f"{contracts} contract(s) ~${size_usdc:,.0f} margin ${margin_usdc:.2f} "
+            f"risk ${risk_usdc:.2f} (entry fee ${entry_fee:.2f})"
         )
         await self._log_trade(pos, order_id="")
         if self._notifier:
@@ -235,16 +242,17 @@ class Executor:
         entry_price: float, stop_loss: float, take_profit: float,
         size_usdc: float, margin_usdc: float, leverage: int,
         risk_usdc: float, strategy: str, confidence: float,
-        reasoning: str,
+        reasoning: str, contracts: int = 0,
     ) -> OrderResult:
         """Place a real CFM market order + exchange-native protective stop."""
         if product_id in self.live_positions or product_id in self.paper_positions:
             return OrderResult(success=False, error=f"Already open: {product_id}")
         try:
             contract_size = await self._get_contract_size(product_id)
-            # Round DOWN to whole contracts so live notional never exceeds
-            # the risk-sized notional.
-            contracts = math.floor(size_usdc / (entry_price * contract_size))
+            if contracts < 1:
+                # Legacy continuous sizing — round DOWN to whole contracts so
+                # live notional never exceeds the risk-sized notional.
+                contracts = math.floor(size_usdc / (entry_price * contract_size))
             if contracts < 1:
                 return OrderResult(
                     success=False,
@@ -253,6 +261,13 @@ class Executor:
                         f"(${entry_price * contract_size:,.2f})"
                     ),
                 )
+            # Whatever the caller estimated, the exchange fills whole contracts:
+            # derive notional AND $-at-risk from the contract count so every
+            # downstream R-multiple uses the real position.
+            live_notional = contracts * entry_price * contract_size
+            if size_usdc > 0 and abs(live_notional - size_usdc) / size_usdc > 1e-6:
+                risk_usdc = risk_usdc * live_notional / size_usdc
+                margin_usdc = margin_usdc * live_notional / size_usdc
 
             side = "BUY" if direction == "long" else "SELL"
             entry = await self.cb.place_futures_market_order(
@@ -275,7 +290,6 @@ class Executor:
                     product_id, direction, contracts, stop_loss,
                 )
 
-            live_notional = contracts * entry_price * contract_size
             pos = PaperPosition(
                 product_id=product_id, display_name=display_name,
                 direction=direction, entry_price=entry_price,
@@ -285,6 +299,7 @@ class Executor:
                 risk_usdc=risk_usdc, strategy=strategy,
                 confidence=confidence, reasoning=reasoning,
                 is_paper=False, fees_usdc=self.fee_for_leg(live_notional),
+                contracts=contracts,
             )
             self.live_positions[product_id] = pos
             self.live_meta[product_id] = {
@@ -573,6 +588,14 @@ class Executor:
 
         pos = self.paper_positions.get(product_id)
         if pos is not None:
+            # Whole-contract parity: a 1-contract paper position cannot be
+            # split any more than a live one can.
+            if pos.contracts > 0:
+                close_contracts = math.floor(pos.contracts * fraction)
+                if close_contracts < 1:
+                    return OrderResult(success=False, error="Fraction rounds to 0 contracts")
+                fraction = close_contracts / pos.contracts
+                pos.contracts -= close_contracts
             closed_notional = pos.size_usdc * fraction
             if pos.direction == "long":
                 realized = (exit_price - pos.entry_price) / pos.entry_price * closed_notional
@@ -616,6 +639,7 @@ class Executor:
                 pos.size_usdc -= closed_notional
                 pos.margin_usdc *= (1 - fraction)
                 meta["contracts"] = contracts - close_contracts
+                pos.contracts = contracts - close_contracts
                 logger.info(
                     f"💰 LIVE PARTIAL: closed {close_contracts} contract(s) of "
                     f"{pos.display_name} @ ~{exit_price:.2f} banked ${realized:+.2f} gross "
@@ -708,6 +732,7 @@ class Executor:
                     if "realized_partial" in row.keys() else 0.0,
                 fees_usdc=float(row["fees_usdc"] or 0.0)
                     if "fees_usdc" in row.keys() else self.fee_for_leg(float(row["size_usdc"])),
+                contracts=int(row["contracts"] or 0) if "contracts" in row.keys() else 0,
             )
             self.paper_positions[product_id] = pos
             restored.append(pos)
@@ -748,6 +773,7 @@ class Executor:
                 "tax_treatment": pos.tax_treatment,
                 "product_type": pos.product_type,
                 "fees_usdc": pos.fees_usdc,
+                "contracts": pos.contracts,
             })
         except Exception as exc:
             logger.warning(f"Failed to log trade: {exc}")

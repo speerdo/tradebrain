@@ -24,6 +24,9 @@ class RiskParams:
     fixed_stop_pct: float = 0.02
     stop_loss_method: str = "atr"
     min_confidence: float = 0.65
+    # Whole-contract sizing ceilings (config.max_risk_per_trade / max_margin_pct)
+    max_risk_per_trade_pct: float = 0.04
+    max_margin_pct: float = 0.50
     circuit_breaker_active: bool = False
     daily_loss_usdc: float = 0.0
     manual_pause: bool = False
@@ -98,6 +101,99 @@ def compute_position_size(entry_price: float, stop_price: float,
             return 0.0, 0.0, 0.0
 
     return notional_size, margin_required, risk_dollars
+
+
+@dataclass
+class ContractSpec:
+    """Whole-contract economics for one CFM product (from the screener's
+    hydrated product list). `margin_rate_*` are the exchange's OVERNIGHT
+    rates — what it actually charges outside the 8am-4pm ET window."""
+    contract_size: float                 # base units per contract (0.1 ETH, 500 NEAR ...)
+    margin_rate_long: float
+    margin_rate_short: float
+
+
+@dataclass
+class ContractSizing:
+    contracts: int
+    notional: float
+    margin: float
+    risk_usdc: float
+    reason: str = ""     # non-empty => rejected (contracts == 0)
+
+
+def compute_contract_position(entry_price: float, stop_price: float,
+                              direction: str, balance: float, risk_pct: float,
+                              spec: ContractSpec,
+                              max_risk_pct: float, max_margin_pct: float,
+                              taker_fee_pct: float = 0.0, min_fee_usdc: float = 0.0,
+                              entry_fee_budget_pct: float | None = None,
+                              ) -> ContractSizing:
+    """
+    Whole-contract position sizing — the live-truth counterpart of
+    `compute_position_size`. CFM fills are whole contracts and the exchange
+    charges margin at its own rate, so "$381 notional at 5x" is not a thing
+    the exchange can execute; "1 contract of ETH PERP, $64 margin" is.
+
+    Rules, in order:
+      1. contracts = floor(target_risk / risk_per_contract). If that is 0
+         (one contract already risks more than risk_pct wants — the normal
+         case on a $200 account), round UP to 1 contract provided its
+         actual $-at-risk <= balance * max_risk_pct.
+      2. Margin (notional * exchange rate for this side) <= balance * max_margin_pct.
+      3. Round-trip fee <= entry_fee_budget_pct * actual risk (same rule as
+         the continuous sizer).
+    Returns contracts == 0 with `reason` set on rejection.
+    """
+    if entry_price <= 0 or spec.contract_size <= 0:
+        return ContractSizing(0, 0.0, 0.0, 0.0, "bad entry price / contract size")
+    stop_pct = abs(entry_price - stop_price) / entry_price
+    if stop_pct <= 0:
+        return ContractSizing(0, 0.0, 0.0, 0.0, "zero stop distance")
+
+    contract_notional = entry_price * spec.contract_size
+    risk_per_contract = contract_notional * stop_pct
+    target_risk = balance * risk_pct
+    hard_max_risk = balance * max_risk_pct
+
+    contracts = int(target_risk // risk_per_contract)
+    if contracts < 1:
+        if risk_per_contract <= hard_max_risk:
+            contracts = 1
+        else:
+            return ContractSizing(
+                0, contract_notional, 0.0, risk_per_contract,
+                f"1 contract risks ${risk_per_contract:.2f} > hard max ${hard_max_risk:.2f} "
+                f"({max_risk_pct:.0%} of ${balance:,.2f}) at a {stop_pct:.2%} stop",
+            )
+
+    rate = spec.margin_rate_long if direction == "long" else spec.margin_rate_short
+    max_margin = balance * max_margin_pct
+    while contracts >= 1:
+        notional = contracts * contract_notional
+        margin = notional * rate
+        if margin <= max_margin:
+            break
+        contracts -= 1
+    if contracts < 1:
+        return ContractSizing(
+            0, contract_notional, contract_notional * rate, risk_per_contract,
+            f"1 contract needs ${contract_notional * rate:.2f} margin ({rate:.0%} overnight rate) "
+            f"> cap ${max_margin:.2f} ({max_margin_pct:.0%} of ${balance:,.2f})",
+        )
+
+    notional = contracts * contract_notional
+    margin = notional * rate
+    risk_usdc = contracts * risk_per_contract
+    if entry_fee_budget_pct is not None and risk_usdc > 0:
+        round_trip_fee = 2 * max(notional * taker_fee_pct, min_fee_usdc)
+        if round_trip_fee > entry_fee_budget_pct * risk_usdc:
+            return ContractSizing(
+                0, notional, margin, risk_usdc,
+                f"round-trip fee ${round_trip_fee:.2f} > {entry_fee_budget_pct:.0%} of "
+                f"${risk_usdc:.2f} risk — stop too tight to pay for itself",
+            )
+    return ContractSizing(contracts, notional, margin, risk_usdc)
 
 
 def compute_stops(entry_price: float, atr: float | None,
@@ -330,8 +426,11 @@ class RiskManager:
             "fixed_stop_pct": "fixed_stop_pct",
             "stop_loss_method": "stop_loss_method",
             "min_confidence": "min_confidence",
-            "paper_balance": "balance_usdc",
+            "max_risk_per_trade": "max_risk_per_trade_pct",
+            "max_margin_pct": "max_margin_pct",
         }
+        if self.cfg.paper_trading:
+            attr_to_field["paper_balance"] = "balance_usdc"
         for attr, field_name in attr_to_field.items():
             val = getattr(self.cfg, attr, None)
             if val is not None:
@@ -495,14 +594,21 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def calculate_trade_params(self, direction: str, entry_price: float,
-                               atr: float | None) -> tuple[float, float, float, float, float]:
-        """Returns (stop_loss, take_profit, notional_size, margin_required, risk_usdc).
+                               atr: float | None,
+                               spec: ContractSpec | None = None,
+                               ) -> tuple[float, float, float, float, float, int]:
+        """Returns (stop_loss, take_profit, notional_size, margin_required,
+        risk_usdc, contracts).
 
-        `risk_usdc` is the ACTUAL dollar risk after margin-cap scaling and any
-        fee-based rejection — use it, don't recompute `balance * risk_pct`
-        (that nominal figure is routinely wrong once the 20%-margin cap
-        binds, which it does on nearly every tight-stop entry at this
-        account size).
+        With a `ContractSpec` (the normal path — the screener hydrates one for
+        every product it selects) sizing is in WHOLE CONTRACTS at the
+        exchange's own margin rate, in paper and live alike, so paper fills
+        are the same lot sizes live would get. Without one (spec unknown) it
+        falls back to the continuous sizer and contracts == 0.
+
+        `risk_usdc` is the ACTUAL dollar risk of the sized position — use it,
+        don't recompute `balance * risk_pct`: with whole contracts the real
+        risk is routinely 1.5-2x the nominal target on a small account.
         """
         sl, tp = compute_stops(
             entry_price, atr,
@@ -514,6 +620,20 @@ class RiskManager:
         )
         # Drawdown-scaled sizing (B3): reduce risk-per-trade in losing streaks
         scaled_risk = self.state.risk_per_trade_pct * self.get_drawdown_scale()
+        if spec is not None:
+            sizing = compute_contract_position(
+                entry_price, sl, direction,
+                self.state.balance_usdc, scaled_risk, spec,
+                max_risk_pct=self.state.max_risk_per_trade_pct,
+                max_margin_pct=self.state.max_margin_pct,
+                taker_fee_pct=self.cfg.taker_fee_pct,
+                min_fee_usdc=self.cfg.min_fee_usdc,
+                entry_fee_budget_pct=self.cfg.entry_fee_budget_pct_of_risk,
+            )
+            if sizing.contracts < 1:
+                logger.info(f"Skipping entry — {sizing.reason}")
+                return sl, tp, 0.0, 0.0, 0.0, 0
+            return sl, tp, sizing.notional, sizing.margin, sizing.risk_usdc, sizing.contracts
         notional, margin, risk = compute_position_size(
             entry_price, sl,
             self.state.balance_usdc,
@@ -523,4 +643,4 @@ class RiskManager:
             min_fee_usdc=self.cfg.min_fee_usdc,
             entry_fee_budget_pct=self.cfg.entry_fee_budget_pct_of_risk,
         )
-        return sl, tp, notional, margin, risk
+        return sl, tp, notional, margin, risk, 0

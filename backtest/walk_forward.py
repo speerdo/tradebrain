@@ -43,8 +43,9 @@ from strategies.base import BaseStrategy
 # Kept small deliberately — each combo runs a full bar-by-bar backtest per
 # fold, so grid size multiplies fold count directly.
 DEFAULT_PARAM_GRID: dict[str, list[float]] = {
-    "atr_multiplier": [1.0, 1.5, 2.0],
-    "take_profit_rr": [1.5, 2.0, 3.0],
+    "atr_multiplier": [2.0, 3.0, 4.0],
+    "take_profit_rr": [3.0, 5.0],
+    "trailing_activate_r": [1.5, 2.5],
 }
 
 
@@ -197,10 +198,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--symbol", default="BTC-PERP", help="Coinbase FCM product_id or alias")
     p.add_argument("--days", type=int, default=360)
     p.add_argument("--folds", type=int, default=6)
-    p.add_argument("--balance", type=float, default=100_000.0)
-    p.add_argument("--leverage", type=int, default=3)
+    p.add_argument("--balance", type=float, default=1_000.0)
+    p.add_argument("--leverage", type=int, default=5)
     p.add_argument("--risk-per-trade", type=float, default=0.01)
-    p.add_argument("--min-confidence", type=float, default=0.0)
+    p.add_argument("--min-confidence", type=float, default=0.65)
     p.add_argument("--metric", default="profit_factor",
                    choices=["profit_factor", "net_pnl", "sharpe_annualized", "win_rate"])
     p.add_argument("--no-cache", action="store_true")

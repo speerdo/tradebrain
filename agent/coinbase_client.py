@@ -40,6 +40,21 @@ class CbFutureProduct:
     funding_rate: float | None
     open_interest: float | None
     mark_price: float | None
+    # Whole-contract economics (filled by hydrate_all). CFM products trade in
+    # whole contracts — 1 contract of NEAR PERP is 500 NEAR (~$1,900 notional),
+    # 1 ETH PERP is 0.1 ETH (~$260) — and the exchange charges margin at ITS
+    # rate (overnight rate outside the 8am-4pm ET intraday window), not at
+    # whatever "leverage" the bot asks for.
+    contract_size: float | None = None
+    margin_rate_long: float | None = None    # overnight long margin rate
+    margin_rate_short: float | None = None   # overnight short margin rate
+
+    @property
+    def contract_notional(self) -> float | None:
+        px = self.mark_price or self.price
+        if not px or not self.contract_size:
+            return None
+        return px * self.contract_size
 
 
 @dataclass(frozen=True)
@@ -201,13 +216,50 @@ class CoinbaseClient:
         # position marks at its entry price and NO stop, take-profit, or
         # trailing ratchet can ever fire.
         mark = data.get("price", "")
+        # Margin rates. The OVERNIGHT rate is what the exchange actually
+        # charges outside the intraday window (measured 2026-09-18 via
+        # /orders/preview at 18:30 ET: 1 ETH PERP contract -> 24.5% margin,
+        # not the 10% intraday rate). Positions here routinely straddle 4pm
+        # ET, so size against the overnight rate — the conservative one.
+        intraday = fp.get("intraday_margin_rate") or {}
+        overnight = fp.get("overnight_margin_rate") or {}
+
+        def _rate(d: dict, key: str) -> float | None:
+            v = d.get(key, "")
+            return float(v) if v else None
+
         return {
             "funding_rate": float(funding) if funding else None,
             "open_interest": float(oi) if oi else None,
             "max_leverage": None,
             "contract_size": float(contract_size) if contract_size else None,
             "mark_price": float(mark) if mark else None,
+            "intraday_margin_long": _rate(intraday, "long_margin_rate"),
+            "intraday_margin_short": _rate(intraday, "short_margin_rate"),
+            "overnight_margin_long": _rate(overnight, "long_margin_rate"),
+            "overnight_margin_short": _rate(overnight, "short_margin_rate"),
         }
+
+    async def preview_futures_market_order(
+        self, product_id: str, side: str, contracts: int,
+    ) -> dict:
+        """
+        Dry-run a market order through /orders/preview. Places NOTHING —
+        returns the exchange's own commission_total, order_margin_total and
+        any errs (e.g. PREVIEW_INSUFFICIENT_FUNDS_FOR_FUTURES). Used by the
+        live preflight to validate payload shape + fee/margin assumptions
+        against the account before real money is at stake.
+        """
+        payload = {
+            "product_id": product_id,
+            "side": side,
+            "order_configuration": {
+                "market_market_ioc": {"base_size": str(contracts)},
+            },
+        }
+        return await self._request(
+            "POST", "/api/v3/brokerage/orders/preview", json=payload
+        )
 
     async def hydrate_all(self, products: list[CbFutureProduct]) -> list[CbFutureProduct]:
         """Hydrate funding/OI for a list of products (concurrent)."""
@@ -227,7 +279,10 @@ class CoinbaseClient:
                         max_leverage=d.get("max_leverage") or p.max_leverage,
                         funding_rate=d.get("funding_rate"),
                         open_interest=d.get("open_interest"),
-                        mark_price=p.mark_price,
+                        mark_price=d.get("mark_price") or p.mark_price,
+                        contract_size=d.get("contract_size"),
+                        margin_rate_long=d.get("overnight_margin_long"),
+                        margin_rate_short=d.get("overnight_margin_short"),
                     )
                 except Exception as exc:
                     logger.warning(f"Failed to hydrate {p.product_id}: {exc}")

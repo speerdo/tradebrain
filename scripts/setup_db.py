@@ -239,6 +239,10 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS realized_partial FLOAT DEFAULT 0.0;
 -- any partial-close legs) instead of gross. This column tracks the total
 -- fee drag per trade for reporting and post-mortems.
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS fees_usdc FLOAT DEFAULT 0.0;
+
+-- Whole-contract sizing: CFM fills whole contracts, so paper and live both
+-- record how many were held (0 = legacy continuously-sized rows).
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS contracts INTEGER DEFAULT 0;
 """
 
 PGVECTOR_INDEX_SQL = """

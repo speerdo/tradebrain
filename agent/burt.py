@@ -43,6 +43,10 @@ TUNABLE_CONFIG: dict[str, dict] = {
     "strategy":          {"type": "enum",   "choices": ["rsi_macd", "bollinger", "ema_pullback", "donchian_breakout"]},
     "signal_interval":   {"type": "int",    "min": 60,   "max": 3600},
     "max_watchlist":     {"type": "int",    "min": 1,    "max": 20},
+    # Whole-contract sizing ceilings (see config.py)
+    "max_risk_per_trade": {"type": "float", "min": 0.01, "max": 0.10},
+    "max_margin_pct":     {"type": "float", "min": 0.10, "max": 0.90},
+    "require_4h_bias":    {"type": "enum",  "choices": ["true", "false"]},
 }
 
 TOOLS = [

@@ -52,7 +52,13 @@ MAX_HOLD_H = 12.0
 # (30%) so the runner is 70% of the book.
 PARTIAL_TP_AT_R = 1.5
 PARTIAL_TP_PCT = 0.3
-ENABLE_PARTIAL_TP = True
+# 2026-09-18 sweep (768 backtests, 3 symbols x 2 strategies, real 0.14%
+# fees): the partial is neutral-to-negative on expectancy in every
+# configuration — it lifts win rate (~+6pts) purely by converting runners
+# into small wins, and adds a third fee leg. With whole-contract sizing a
+# 1-contract position can't be split anyway, so paper and live would
+# diverge if it stayed on. Off in both modes.
+ENABLE_PARTIAL_TP = False
 # Force-close at MAX_HOLD_H only when the position hasn't paid — closing
 # winners at the deadline was converting +1R runners into 0R time exits.
 TIME_EXIT_MIN_R = 0.5
@@ -170,8 +176,9 @@ class PositionMonitor:
         meta = self._pos_meta.get(pos.product_id)
         if meta is None:
             # Position opened before monitor was aware (e.g. restart) — bootstrap
+            atr_mult = float(getattr(self.risk.state, "atr_multiplier", 0) or 0) or 3.0
             meta = {
-                "atr": abs(pos.entry_price - pos.stop_loss) / 1.5 if pos.stop_loss else 0.0,
+                "atr": abs(pos.entry_price - pos.stop_loss) / atr_mult if pos.stop_loss else 0.0,
                 "original_stop": pos.stop_loss,
                 "original_size": pos.size_usdc,
                 "partial_done": True,  # skip partial TP for bootstrap positions

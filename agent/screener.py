@@ -17,6 +17,7 @@ from agent.coinbase_client import CoinbaseClient
 from agent.indicator_engine import compute_screener_indicators
 from agent.database import get_db
 from agent.derivatives import DerivativesContext
+from agent.risk_manager import ContractSpec
 import config
 
 
@@ -45,12 +46,45 @@ class Screener:
     MIN_LEVERAGE = 5
     MIN_PRICE = 0.0001
 
-    def __init__(self, cb: CoinbaseClient):
+    def __init__(self, cb: CoinbaseClient, risk: Any = None):
         self.cb = cb
         self.cfg = config.get_config()
         self._derivatives = DerivativesContext()
         # product_id -> friendly name ("BTC PERP"), for logs and Discord alerts
         self.display_names: dict[str, str] = {}
+        # product_id -> ContractSpec for every product hydrated on the last
+        # run. main.py hands these to RiskManager.calculate_trade_params so
+        # sizing is in whole contracts at the exchange's margin rate.
+        self.specs: dict[str, ContractSpec] = {}
+        # RiskManager (optional) — supplies the live balance for the
+        # affordability filter below.
+        self.risk = risk
+
+    def _affordable(self, p) -> str:
+        """
+        Returns "" if one contract of `p` fits this account, else the reason.
+
+        Whole contracts make most of the universe untradeable on a small
+        account: 1 NEAR PERP contract is ~$1,900 notional / $715 overnight
+        margin. Without this filter the bot spends an LLM call per tick on
+        symbols it can never fill, and the watchlist has no room for the
+        ones it can.
+        """
+        if self.risk is None:
+            return ""
+        balance = float(getattr(self.risk.state, "balance_usdc", 0) or 0)
+        if balance <= 0:
+            return ""
+        notional = p.contract_notional
+        if not notional or not p.margin_rate_long or not p.margin_rate_short:
+            return "no contract economics from exchange"
+        rate = max(p.margin_rate_long, p.margin_rate_short)
+        margin = notional * rate
+        max_margin = balance * self.risk.state.max_margin_pct
+        if margin > max_margin:
+            return (f"1 contract = ${notional:,.0f} notional, ${margin:,.0f} margin "
+                    f"({rate:.0%} overnight) > ${max_margin:,.0f} cap")
+        return ""
 
     async def run(self, max_watchlist: int | None = None) -> list[str]:
         max_watchlist = max_watchlist or self.cfg.max_watchlist
@@ -67,6 +101,7 @@ class Screener:
 
         # 3. Apply thresholds
         candidates = []
+        unaffordable: list[str] = []
         for p in products:
             if not p.trading_enabled:
                 continue
@@ -76,10 +111,29 @@ class Screener:
                 continue
             if (p.mark_price or 0) < self.MIN_PRICE:
                 continue
+            why = self._affordable(p)
+            if why:
+                unaffordable.append(f"{p.display_name}: {why}")
+                continue
             candidates.append(p)
+            if p.contract_size and p.margin_rate_long and p.margin_rate_short:
+                self.specs[p.product_id] = ContractSpec(
+                    contract_size=p.contract_size,
+                    margin_rate_long=p.margin_rate_long,
+                    margin_rate_short=p.margin_rate_short,
+                )
 
+        if unaffordable:
+            logger.info(
+                f"Screener: {len(unaffordable)} product(s) skipped as unaffordable for this "
+                f"account — " + "; ".join(unaffordable)
+            )
         logger.info(f"Screener: {len(candidates)} candidates after filtering")
         if not candidates:
+            logger.warning(
+                "Screener: NOTHING tradeable at this account size — every liquid product's "
+                "single-contract margin exceeds max_margin_pct of balance"
+            )
             return []
 
         # 4. Fetch 1H candles
