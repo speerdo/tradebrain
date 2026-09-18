@@ -507,7 +507,10 @@ class CoinbaseClient:
         """Check if CFM account exists and has buying power."""
         try:
             summary = await self.get_futures_balance_summary()
-            bp = float(summary.get("futures_buying_power", {}).get("value", 0))
+            # The API nests everything under balance_summary; reading the
+            # top level logged "$0.00" on a funded account.
+            bs = summary.get("balance_summary", summary) or {}
+            bp = float((bs.get("futures_buying_power") or {}).get("value") or 0)
             logger.info(f"Futures buying power: ${bp:.2f}")
             return True
         except Exception as exc:
