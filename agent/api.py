@@ -12,6 +12,8 @@ from pydantic import BaseModel
 from loguru import logger
 
 import config
+from agent import trading_mode
+from agent.account import AccountService
 from agent.database import get_db
 from agent.executor import Executor
 from agent.risk_manager import RiskManager
@@ -44,13 +46,35 @@ class ConfigUpdate(BaseModel):
 _executor: Executor | None = None
 _risk_manager: RiskManager | None = None
 _screener: Screener | None = None
+_account: AccountService | None = None
 
 
-def set_agent_state(executor: Executor, risk_manager: RiskManager, screener: Screener) -> None:
-    global _executor, _risk_manager, _screener
+def set_agent_state(executor: Executor, risk_manager: RiskManager, screener: Screener,
+                    account: AccountService | None = None) -> None:
+    global _executor, _risk_manager, _screener, _account
     _executor = executor
     _risk_manager = risk_manager
     _screener = screener
+    _account = account
+
+
+def _mode_filter(mode: str | None) -> bool | None:
+    """Resolve a ?mode= query param to an is_paper filter.
+
+    Default is the mode the agent is RUNNING in: paper and live rows share
+    the trades table, and a live dashboard showing simulated fills mixed in
+    with real ones is worse than no dashboard. 'all' opts out explicitly.
+    """
+    if mode is None or mode == "":
+        return bool(config.get_config().paper_trading)
+    normalized = mode.strip().lower()
+    if normalized == "all":
+        return None
+    if normalized in ("paper", "true"):
+        return True
+    if normalized in ("live", "false"):
+        return False
+    raise HTTPException(status_code=400, detail="mode must be paper, live or all")
 
 
 # ------------------------------------------------------------------
@@ -68,8 +92,12 @@ async def get_status() -> dict:
     # from there caused the slider to snap back to the old value before the
     # agent had a chance to sync. RiskManager.state is still authoritative for
     # genuinely dynamic state (circuit breaker, daily loss, manual pause).
+    snap = _account.last if _account else None
     return {
         "paper_trading": cfg.paper_trading,
+        "mode": trading_mode.current_mode(cfg),
+        "boot_mode": trading_mode.boot_mode(),
+        "mode_drift": trading_mode.check_boot_drift(cfg),
         "strategy": cfg.strategy,
         "leverage": cfg.leverage,
         "risk_per_trade": cfg.risk_per_trade,
@@ -84,16 +112,97 @@ async def get_status() -> dict:
         "max_risk_per_trade": cfg.max_risk_per_trade,
         "max_margin_pct": cfg.max_margin_pct,
         "require_4h_bias": cfg.require_4h_bias,
+        # Equity the agent is actually sizing off — the exchange's number in
+        # live mode, the paper ledger in paper mode.
         "balance_usdc": rm_state.balance_usdc if rm_state else 0.0,
+        "balance_source": rm_state.balance_source if rm_state else "",
+        "balance_stale": rm_state.balance_stale if rm_state else False,
+        "balance_age_sec": round(rm_state.balance_age_sec, 1) if rm_state else 0.0,
+        "buying_power_usdc": snap.buying_power_usdc if snap else 0.0,
+        "unrealized_pnl_usdc": snap.unrealized_pnl_usdc if snap else 0.0,
+        "exchange_realized_pnl_usdc": (
+            rm_state.exchange_realized_pnl_usdc if rm_state else 0.0
+        ),
         "circuit_breaker_active": rm_state.circuit_breaker_active if rm_state else False,
         "daily_loss_usdc": rm_state.daily_loss_usdc if rm_state else 0.0,
+        "daily_loss_limit_usdc": (
+            rm_state.balance_usdc * rm_state.daily_loss_limit_pct if rm_state else 0.0
+        ),
         "manual_pause": rm_state.manual_pause if rm_state else False,
         "open_positions_count": len(_executor.get_open_positions()) if _executor else 0,
     }
 
 
+@app.get("/api/account")
+async def get_account(refresh: bool = False) -> dict:
+    """Live account equity straight from Coinbase (or the paper ledger)."""
+    if _account is None:
+        raise HTTPException(status_code=503, detail="Account service not initialized")
+    snap = await _account.get(force=refresh)
+    return {
+        "mode": snap.mode,
+        "equity_usdc": snap.equity_usdc,
+        "buying_power_usdc": snap.buying_power_usdc,
+        "cash_usdc": snap.cash_usdc,
+        "unrealized_pnl_usdc": snap.unrealized_pnl_usdc,
+        "daily_realized_pnl_usdc": snap.daily_realized_pnl_usdc,
+        "initial_margin_usdc": snap.initial_margin_usdc,
+        "maintenance_margin_usdc": snap.maintenance_margin_usdc,
+        "source": snap.source,
+        "stale": snap.stale,
+        "age_sec": round(snap.age_sec, 1),
+    }
+
+
+@app.get("/api/account/history")
+async def get_account_history(days: int = 30, mode: str | None = None,
+                              all_sources: bool = False) -> list[dict]:
+    """
+    Persisted equity snapshots — the real account's equity curve.
+
+    Scoped to the configured `live_equity_source` by default: snapshots taken
+    from a different balance field measure a different slice of the account
+    and would show a step change where nothing moved. `all_sources=true`
+    returns the raw history.
+    """
+    db = await get_db()
+    cfg = config.get_config()
+    resolved = (mode or trading_mode.current_mode()).upper()
+    source = None if (all_sources or resolved == "PAPER") else cfg.live_equity_source
+    rows = await db.get_account_equity_curve(resolved, days, source=source)
+    return [_record_to_dict(r) for r in rows]
+
+
+@app.get("/api/fills")
+async def get_fills(limit: int = 100, trade_id: int | None = None) -> list[dict]:
+    """Exchange fills — the audit trail against Coinbase's own history."""
+    db = await get_db()
+    if trade_id:
+        rows = await db.get_fills_for_trade(trade_id)
+    else:
+        rows = await db.fetch(
+            "SELECT * FROM fills ORDER BY filled_at DESC NULLS LAST LIMIT $1", limit
+        )
+    return [_record_to_dict(r) for r in rows]
+
+
 @app.patch("/api/config")
 async def update_config(update: ConfigUpdate) -> dict:
+    # Mode is not a runtime knob. Flipping paper_trading under a running
+    # agent leaves in-memory positions, the paper ledger and the day's loss
+    # budget belonging to the old mode — the exact mismatch the mode guards
+    # exist to prevent. Refuse here rather than let it land and pause the loop.
+    if update.key == "paper_trading":
+        requested = trading_mode.parse_flag(update.value)
+        if requested is not None and requested is not bool(config.get_config().paper_trading):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Trading mode is {trading_mode.current_mode()} and cannot be "
+                    "changed while the agent is running. Stop it, set PAPER_TRADING "
+                    "in .env and agent_config.paper_trading to match, then restart."
+                ),
+            )
     try:
         config.set_config_key(update.key, update.value)
         db = await get_db()
@@ -104,9 +213,9 @@ async def update_config(update: ConfigUpdate) -> dict:
 
 
 @app.get("/api/trades")
-async def get_trades(limit: int = 50) -> list[dict]:
+async def get_trades(limit: int = 50, mode: str | None = None) -> list[dict]:
     db = await get_db()
-    rows = await db.get_recent_trades(limit)
+    rows = await db.get_recent_trades(limit, is_paper=_mode_filter(mode))
     return [_record_to_dict(r) for r in rows]
 
 
@@ -118,22 +227,21 @@ async def get_signals(limit: int = 100) -> list[dict]:
 
 
 @app.get("/api/stats")
-async def get_stats() -> dict:
+async def get_stats(mode: str | None = None) -> dict:
     db = await get_db()
-    stats = await db.get_today_stats()
-    return stats
+    return await db.get_today_stats(is_paper=_mode_filter(mode))
 
 
 @app.get("/api/analytics")
-async def get_analytics() -> dict:
+async def get_analytics(mode: str | None = None) -> dict:
     from agent.analytics import compute_analytics
-    return await compute_analytics()
+    return await compute_analytics(is_paper=_mode_filter(mode))
 
 
 @app.get("/api/analytics/review")
-async def get_weekly_review() -> dict:
+async def get_weekly_review(mode: str | None = None) -> dict:
     from agent.analytics import weekly_self_review
-    return {"review": await weekly_self_review()}
+    return {"review": await weekly_self_review(is_paper=_mode_filter(mode))}
 
 
 @app.get("/api/watchlist")
@@ -177,9 +285,12 @@ async def get_positions() -> list[dict]:
             "margin_usdc": p.margin_usdc,
             "leverage": p.leverage,
             "is_paper": p.is_paper,
+            "mode": p.mode,
             "opened_at": p.opened_at,
             "strategy": p.strategy,
             "confidence": p.confidence,
+            "trade_id": p.trade_id,
+            "order_id": p.entry_order_id,
         }
         for p in positions
     ]

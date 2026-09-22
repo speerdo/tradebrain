@@ -136,6 +136,8 @@ CREATE INDEX IF NOT EXISTS idx_discord_messages_created ON discord_messages(crea
 COMMENT ON TABLE memories IS 'Burt semantic memory store. Run manual index creation after 1000+ rows.';
 
 -- Insert default config values if not present
+-- NOTE: agent_config.paper_trading must agree with PAPER_TRADING in .env —
+-- the agent refuses to start if they disagree (agent/trading_mode.py).
 INSERT INTO agent_config (key, value) VALUES
     ('paper_trading', 'true'),
     ('leverage', '3'),
@@ -243,6 +245,90 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS fees_usdc FLOAT DEFAULT 0.0;
 -- Whole-contract sizing: CFM fills whole contracts, so paper and live both
 -- record how many were held (0 = legacy continuously-sized rows).
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS contracts INTEGER DEFAULT 0;
+
+-- =========================================================================
+-- LIVE ORDER AUDIT
+-- Real exchange identities and real fill data on every trade row, so a row
+-- here can be reconciled line-by-line against Coinbase's order history.
+-- The existing entry_price / fees_usdc stay as the bot's MODELED numbers;
+-- the filled_* / exchange_fees_usdc columns are what actually happened.
+-- =========================================================================
+
+-- Our id for the entry order, minted before the request is sent: the only
+-- handle that can find an order the exchange accepted but whose response
+-- never came back.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS client_order_id TEXT;
+-- Resting exchange-native protective stop for this position.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_order_id TEXT;
+-- The closing order.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_order_id TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_client_order_id TEXT;
+-- Volume-weighted ACTUAL fill prices from the exchange (vs. our estimate).
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS filled_entry_price FLOAT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS filled_exit_price FLOAT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS filled_contracts FLOAT;
+-- Commission Coinbase actually charged, vs. the modeled taker fee.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exchange_fees_usdc FLOAT DEFAULT 0;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS fills_synced_at TIMESTAMPTZ;
+
+-- One row per real exchange fill. fill_id is Coinbase's own fill id and is
+-- UNIQUE, so re-syncing a window of history is idempotent — that is what
+-- lets the periodic sweep re-read recent fills without duplicating them.
+CREATE TABLE IF NOT EXISTS fills (
+    id                  SERIAL PRIMARY KEY,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    trade_id            INT REFERENCES trades(id) ON DELETE SET NULL,
+    fill_id             TEXT NOT NULL UNIQUE,
+    order_id            TEXT NOT NULL,
+    client_order_id     TEXT,
+    product_id          TEXT NOT NULL,
+    side                TEXT,
+    leg                 TEXT,          -- entry | exit | partial
+    price               FLOAT,
+    size                FLOAT,         -- contracts
+    commission_usdc     FLOAT,
+    liquidity_indicator TEXT,
+    filled_at           TIMESTAMPTZ,
+    is_paper            BOOLEAN DEFAULT FALSE,
+    raw                 JSONB
+);
+
+-- Periodic equity snapshots of the REAL account (and the paper ledger, under
+-- mode='PAPER'): the live equity curve, and the audit trail that balance
+-- changes can be reconciled against.
+CREATE TABLE IF NOT EXISTS account_snapshots (
+    id                      SERIAL PRIMARY KEY,
+    created_at              TIMESTAMPTZ DEFAULT NOW(),
+    mode                    TEXT NOT NULL,        -- 'LIVE' | 'PAPER'
+    equity_usdc             FLOAT NOT NULL,
+    buying_power_usdc       FLOAT,
+    cash_usdc               FLOAT,
+    unrealized_pnl_usdc     FLOAT,
+    daily_realized_pnl_usdc FLOAT,
+    initial_margin_usdc     FLOAT,
+    maintenance_margin_usdc FLOAT,
+    source                  TEXT,                 -- which balance field equity came from
+    raw                     JSONB
+);
+
+-- =========================================================================
+-- INDEXES for the mode-scoped reads
+-- Paper and live rows share `trades`, and every read is now filtered by
+-- is_paper; without this each one is a full scan that grows forever.
+-- =========================================================================
+CREATE INDEX IF NOT EXISTS idx_trades_mode_status
+    ON trades(is_paper, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_mode_closed
+    ON trades(is_paper, closed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_order_id ON trades(order_id);
+CREATE INDEX IF NOT EXISTS idx_trades_exit_order_id ON trades(exit_order_id);
+CREATE INDEX IF NOT EXISTS idx_trades_stop_order_id ON trades(stop_order_id);
+CREATE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id);
+CREATE INDEX IF NOT EXISTS idx_fills_trade ON fills(trade_id);
+CREATE INDEX IF NOT EXISTS idx_fills_filled_at ON fills(filled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fills_product ON fills(product_id, filled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_account_snap_mode
+    ON account_snapshots(mode, created_at DESC);
 """
 
 PGVECTOR_INDEX_SQL = """
@@ -272,8 +358,10 @@ async def create_schema(dsn: str) -> None:
         tables = [r["table_name"] for r in rows]
         logger.info(f"Tables in DB: {', '.join(tables)}")
 
-        if len(tables) < 7:
-            raise RuntimeError(f"Expected 7+ tables, got {len(tables)}: {tables}")
+        required = {"trades", "signals", "fills", "account_snapshots", "agent_config"}
+        missing = required - set(tables)
+        if missing:
+            raise RuntimeError(f"Schema incomplete — missing tables: {sorted(missing)}")
 
         logger.success("✓ Database setup complete")
     finally:

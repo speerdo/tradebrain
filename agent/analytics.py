@@ -21,6 +21,8 @@ from typing import Any
 
 import numpy as np
 
+import config
+from agent import trading_mode
 from agent.database import get_db
 
 
@@ -63,7 +65,35 @@ def _max_drawdown(equity: list[float]) -> float:
     return max_dd
 
 
-async def compute_analytics(starting_balance: float | None = None) -> dict:
+async def _default_starting_balance(db, is_paper: bool | None) -> float:
+    """
+    The equity the curve starts from, per mode.
+
+    Paper: the persistent paper ledger. Live: the earliest recorded equity
+    snapshot of the real account (account_snapshots), falling back to its
+    latest one — a hardcoded 100k placeholder made every live drawdown and
+    Sharpe number meaningless on a $200 account.
+    """
+    if is_paper is not False:
+        stored = await db.get_config_value("paper_balance")
+        if stored is not None:
+            try:
+                return float(stored)
+            except ValueError:
+                pass
+        return float(config.get_config().paper_balance or 0) or 1.0
+    source = config.get_config().live_equity_source
+    rows = await db.get_account_equity_curve(trading_mode.LIVE, days=3650, source=source)
+    if rows:
+        return float(rows[0]["equity_usdc"]) or 1.0
+    latest = await db.get_latest_account_snapshot(trading_mode.LIVE)
+    if latest and latest["equity_usdc"]:
+        return float(latest["equity_usdc"])
+    return 1.0
+
+
+async def compute_analytics(starting_balance: float | None = None,
+                            is_paper: bool | None = None) -> dict:
     """
     Compute full analytics from the trades table.
 
@@ -72,27 +102,32 @@ async def compute_analytics(starting_balance: float | None = None) -> dict:
       - summary: overall metrics
       - by_strategy, by_symbol, by_hour, by_confidence: sliced stats
 
-    `starting_balance` defaults to the persistent paper balance for paper
-    mode (100k placeholder for live) so the equity curve reflects the real,
-    PnL-updated account rather than a hardcoded number.
+    `is_paper` scopes every metric to one book. Paper and live rows live in
+    the same table, and blending simulated fills into a live equity curve
+    makes every number on it — drawdown, Sharpe, expectancy — describe an
+    account that does not exist. `None` deliberately blends both, for a
+    whole-history export.
+
+    `starting_balance` defaults per mode: the paper ledger for paper, the
+    account's first recorded equity snapshot for live.
     """
     db = await get_db()
     if starting_balance is None:
-        starting_balance = 100_000.0
-        key = await db.get_config_value("paper_balance")
-        if key is not None:
-            try:
-                starting_balance = float(key)
-            except ValueError:
-                pass
+        starting_balance = await _default_starting_balance(db, is_paper)
+    where = "WHERE status != 'open' AND pnl_usdc IS NOT NULL"
+    args: list = []
+    if is_paper is not None:
+        where += " AND is_paper = $1"
+        args.append(is_paper)
     rows = await db.fetch(
-        """
+        f"""
         SELECT symbol, direction, strategy, confidence, entry_price, exit_price,
-               pnl_usdc, created_at, closed_at, status
+               pnl_usdc, created_at, closed_at, status, is_paper
         FROM trades
-        WHERE status != 'open' AND pnl_usdc IS NOT NULL
+        {where}
         ORDER BY closed_at ASC
-        """
+        """,
+        *args,
     )
 
     if not rows:
@@ -233,26 +268,37 @@ async def parse_failure_rate(days: int = 7) -> dict:
     return out
 
 
-async def weekly_self_review() -> str:
+async def weekly_self_review(is_paper: bool | None = None) -> str:
     """
     Produce a Burt-readable weekly review string.
 
     Format: "EMA pullback is 3W/9L in ranging regime — suggest disabling it there."
     (For now we slice by strategy only — regime tagging of past trades requires
     C1 wiring first. We still surface the worst-performing strategies.)
+
+    Scoped to the running mode by default: advice to disable a strategy
+    should be drawn from the book that is actually trading, not from paper
+    trades taken under different settings weeks ago.
     """
+    if is_paper is None:
+        is_paper = bool(config.get_config().paper_trading)
     db = await get_db()
     rows = await db.fetch(
         """
         SELECT strategy, direction, pnl_usdc
         FROM trades
         WHERE status != 'open' AND pnl_usdc IS NOT NULL
+          AND is_paper = $1
           AND closed_at >= NOW() - INTERVAL '7 days'
         ORDER BY closed_at ASC
-        """
+        """,
+        is_paper,
     )
     if not rows:
-        return "No closed trades in the last 7 days — nothing to review."
+        return (
+            f"No closed {trading_mode.mode_of(is_paper)} trades in the last 7 days "
+            "— nothing to review."
+        )
 
     by_strat: dict[str, list[float]] = defaultdict(list)
     for r in rows:

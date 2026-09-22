@@ -381,13 +381,19 @@ class CoinbaseClient:
     async def place_futures_market_order(
         self, product_id: str, side: str, contracts: int,
         leverage: int = 1, margin_type: str = "ISOLATED",
+        client_order_id: str | None = None,
     ) -> dict:
         """
         Market entry for a CFM future. `contracts` is whole contracts
         (base_size is contract count for futures, not base currency).
+
+        `client_order_id` is OUR id for the order. Pass one in and it can be
+        recorded on the trade row before the response is even parsed, which
+        is what makes an order auditable if the request times out after the
+        exchange accepted it — the id is the only way to find it again.
         """
         payload = {
-            "client_order_id": secrets.token_hex(16),
+            "client_order_id": client_order_id or secrets.token_hex(16),
             "product_id": product_id,
             "side": side,
             "order_configuration": {
@@ -422,14 +428,18 @@ class CoinbaseClient:
         }
         return await self.place_order(payload)
 
-    async def close_futures_position(self, product_id: str, size: str | None = None) -> dict:
+    async def close_futures_position(self, product_id: str, size: str | None = None,
+                                     client_order_id: str | None = None) -> dict:
         """
         Close a CFM position via the dedicated close-position endpoint
         (marketable, reduce-only). `size` = contracts for partial close;
         omit for full close.
+
+        The response carries the closing order's id — record it, or the exit
+        leg of the trade has no exchange identity to audit against.
         """
         payload: dict = {
-            "client_order_id": secrets.token_hex(16),
+            "client_order_id": client_order_id or secrets.token_hex(16),
             "product_id": product_id,
         }
         if size is not None:
@@ -465,10 +475,37 @@ class CoinbaseClient:
         )
         return data.get("orders", [])
 
-    async def get_fills(self) -> list[dict]:
-        """Get recent fills."""
+    async def get_order(self, order_id: str) -> dict:
+        """
+        One order's exchange-side truth: status, average_filled_price,
+        filled_size and total_fees. The order response returned at placement
+        has none of these — it is an acknowledgement, not a fill.
+        """
         data = await self._request(
-            "GET", "/api/v3/brokerage/orders/historical/fills"
+            "GET", f"/api/v3/brokerage/orders/historical/{order_id}"
+        )
+        return data.get("order", data) or {}
+
+    async def get_fills(self, order_ids: list[str] | None = None,
+                        product_ids: list[str] | None = None,
+                        limit: int = 100,
+                        start: str | None = None) -> list[dict]:
+        """
+        Fills from the exchange's own history — the auditable record of what
+        actually traded, at what price, for what commission.
+
+        `order_ids` / `product_ids` are repeated query params, so the params
+        are built as a list of pairs (a dict would keep only the last value).
+        """
+        params: list[tuple[str, str]] = [("limit", str(limit))]
+        for oid in order_ids or []:
+            params.append(("order_ids", oid))
+        for pid in product_ids or []:
+            params.append(("product_ids", pid))
+        if start:
+            params.append(("start_sequence_timestamp", start))
+        data = await self._request(
+            "GET", "/api/v3/brokerage/orders/historical/fills", params=params
         )
         return data.get("fills", [])
 

@@ -103,8 +103,48 @@ class Config(BaseModel):
     # Paper-mode account size. RiskManager sizes every position and sets the
     # circuit-breaker threshold off this, so it must reflect the budget you
     # are actually simulating — the old hardcoded 100k made a "1% risk" trade
-    # $1,000 and put the daily loss limit at $5,000.
+    # $1,000 and put the daily loss limit at $5,000. LIVE mode ignores this
+    # entirely: equity comes from /cfm/balance_summary (agent/account.py).
     paper_balance: float = Field(default=200.0)
+
+    # ------------------------------------------------------------------
+    # Live account data (agent/account.py) — LIVE mode only
+    # ------------------------------------------------------------------
+    # Which balance_summary field is "the account" for sizing and the daily
+    # stop, falling back through the others if the chosen one is 0.
+    #
+    # total_usd_balance is the default because it is the account: measured
+    # 2026-09-22, cfm_usd_balance was $68.13 while cbi_usd_balance held
+    # another $131.79 of USD that the exchange sweeps into futures on demand
+    # (futures_buying_power $195.41 confirms it is usable). Sizing off the
+    # CFM slice alone would have valued a $200 account at $68 — at 2%
+    # risk/trade that is $1.36, less than one ETH contract's $-at-risk, so
+    # the bot would have gone quiet; it would also have put the 5% daily
+    # stop at $3.41, below a single round-trip fee-plus-stop loss, tripping
+    # the breaker on the first losing trade of any day.
+    live_equity_source: str = Field(default="total_usd_balance")
+    # Cache TTL for the balance summary. The signal loop, the 30s position
+    # monitor, the dashboard and Burt all read equity; without a shared cache
+    # that is four /cfm/balance_summary calls where one will do.
+    balance_refresh_sec: float = Field(default=30.0)
+    # How often an equity snapshot is written to account_snapshots (audit
+    # trail + live equity curve). 0 disables.
+    account_snapshot_interval_sec: float = Field(default=300.0)
+    # Refuse NEW live entries when the last good balance is older than this.
+    # Sizing a position against a balance the exchange stopped confirming is
+    # how a 1% risk becomes an unbounded one. 0 disables the check.
+    max_balance_staleness_sec: float = Field(default=300.0)
+    # Live circuit breaker: trip on the EXCHANGE's own realized P&L for the
+    # session (balance_summary.daily_realized_pnl) as well as our modeled
+    # P&L, whichever is worse. The exchange sees fills we never do — a stop
+    # that filled while the bot was down, a manual close from the app.
+    use_exchange_realized_pnl: bool = Field(default=True)
+    # Pull fills from /orders/historical/fills after every live order and
+    # reconcile them into the trades + fills tables (audit against Coinbase).
+    sync_fills: bool = Field(default=True)
+    # Attempts (1s apart) to find an order's fills before giving up — the
+    # fills endpoint lags the order response by a beat.
+    fill_sync_attempts: int = Field(default=4)
     signal_model: str = Field(default="moonshotai/kimi-k2.6")
 
     # ------------------------------------------------------------------
@@ -214,6 +254,12 @@ class Config(BaseModel):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    @property
+    def mode(self) -> str:
+        """'PAPER' or 'LIVE' — see agent/trading_mode.py for the guards that
+        keep this in step with the DB flag and each position's is_paper."""
+        return "PAPER" if self.paper_trading else "LIVE"
+
     def is_required_key_present(self, key: str) -> bool:
         """Check if a specific env var is present."""
         val = getattr(self, key, "")
@@ -327,6 +373,13 @@ def _build_config() -> Config:
         # keeps its class default and every *_MODEL / *_PROVIDER in .env is
         # ignored no matter what .env.example documents.
         paper_balance=_float("PAPER_BALANCE", 200.0),
+        live_equity_source=_env("LIVE_EQUITY_SOURCE", "total_usd_balance"),
+        balance_refresh_sec=_float("BALANCE_REFRESH_SEC", 30.0),
+        account_snapshot_interval_sec=_float("ACCOUNT_SNAPSHOT_INTERVAL_SEC", 300.0),
+        max_balance_staleness_sec=_float("MAX_BALANCE_STALENESS_SEC", 300.0),
+        use_exchange_realized_pnl=_bool("USE_EXCHANGE_REALIZED_PNL", True),
+        sync_fills=_bool("SYNC_FILLS", True),
+        fill_sync_attempts=_int("FILL_SYNC_ATTEMPTS", 4),
         taker_fee_pct=_float("TAKER_FEE_PCT", 0.0014),
         min_fee_usdc=_float("MIN_FEE_USDC", 0.0),
         max_risk_per_trade=_float("MAX_RISK_PER_TRADE", 0.04),

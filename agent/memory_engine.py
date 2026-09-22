@@ -136,8 +136,12 @@ class MemoryEngine:
         """
         try:
             db = await get_db()
-            trades = await db.get_recent_trades(limit=50)
-            stats = await db.get_today_stats()
+            # Scoped to the running book: lessons learned from simulated
+            # fills are not lessons about the live account, and mixing them
+            # is how a paper losing streak talks a live agent out of trading.
+            is_paper = bool(config.get_config().paper_trading)
+            trades = await db.get_recent_trades(limit=50, is_paper=is_paper)
+            stats = await db.get_today_stats(is_paper=is_paper)
 
             # Build consolidation prompt
             trades_text = "\n".join(

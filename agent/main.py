@@ -21,7 +21,8 @@ import uvicorn
 from loguru import logger
 
 import config
-from agent import llm_router
+from agent import llm_router, trading_mode
+from agent.account import AccountService
 from agent.api import app, set_agent_state
 from agent.burt import Burt
 from agent.coinbase_client import CoinbaseClient
@@ -47,6 +48,7 @@ class TradeBrainAgent:
         self.cfg = config.get_config()
         self.db = None
         self.cb = CoinbaseClient()
+        self.account = AccountService(self.cb)
         self.executor = Executor(self.cb)
         self.risk = RiskManager()
         # The screener needs the balance to drop products whose single
@@ -68,6 +70,9 @@ class TradeBrainAgent:
         self.executor.set_risk_manager(self.risk)
         self.risk.set_client(self.cb)
         self.risk.set_notifier(self.notifier)
+        # LIVE equity comes from the exchange via this one service; paper
+        # equity comes from the persistent ledger through the same interface.
+        self.risk.set_account(self.account)
         self.watchlist: list[str] = []
         self._shutdown = asyncio.Event()
         self._api_task = None
@@ -84,6 +89,21 @@ class TradeBrainAgent:
 
         self.db = await get_db()
         logger.info("✅ Database connected")
+
+        # Mode first, before anything reads a balance or touches a position.
+        # .env and agent_config both carry paper_trading and both are read at
+        # different moments; if they disagree the agent would route orders by
+        # one and stamp/report by the other. Refuse to start instead.
+        trading_mode.lock_boot_mode(self.cfg)
+        mismatch = trading_mode.check_db_agreement(
+            await self.db.get_config_value("paper_trading"), self.cfg
+        )
+        if mismatch:
+            logger.error(f"Trading mode mismatch: {mismatch}")
+            raise RuntimeError(
+                f"Refusing to start — {mismatch}. Make .env PAPER_TRADING and "
+                "agent_config.paper_trading agree, then restart."
+            )
 
         # P3: enforce MODELS.md §2 — the run plane pays per token. A seat
         # subscription on the run plane degrades silently within hours.
@@ -106,15 +126,28 @@ class TradeBrainAgent:
 
         # P0: live positions are reconciled from the exchange before anything
         # evaluates — portfolio caps and re-entry suppression must see reality.
+        # The DB restore runs FIRST so each position keeps the stop, target and
+        # strategy it was opened with; reconciliation then corrects it against
+        # the exchange (and closes out anything no longer there). Without the
+        # restore every live position came back as an "adopted" unknown with no
+        # stop, which blocks all new entries until it is closed by hand.
         if not self.cfg.paper_trading:
+            known = await self.executor.restore_live_positions()
             live = await self.executor.reconcile_live_positions()
-            logger.info(f"Live reconciliation: {len(live)} open position(s) on exchange")
+            logger.info(
+                f"Live reconciliation: {len(live)} open position(s) on exchange "
+                f"({len(known)} restored from DB)"
+            )
+            await self.executor.sync_recent_fills()
 
         # Balance before anything reads it. risk.sync() would fix this on the
         # first loop tick, but the API/UI and Burt come up before that and would
-        # report the 100k placeholder as the account size.
+        # report a placeholder as the account size.
         await self.db.sync_config()
         await self.risk.sync()
+        # The breaker's counter is in-memory: without this, restarting mid-day
+        # handed the day a fresh loss budget every time.
+        await self.risk.seed_daily_loss()
 
         # Paper positions are in-memory only — restore open ones from the
         # trades table before the monitor, screener, or risk caps read them,
@@ -124,18 +157,29 @@ class TradeBrainAgent:
         if restored:
             logger.info(f"Paper restore: {len(restored)} position(s) back under management")
 
+        snap = await self.account.get()
         logger.info(
-            f"Account: ${self.risk.state.balance_usdc:,.2f} "
-            f"({'PAPER' if self.cfg.paper_trading else 'LIVE'}) | "
+            f"Account [{trading_mode.current_mode(self.cfg)}]: {snap.summary_line()}"
+        )
+        logger.info(
+            f"Sizing off ${self.risk.state.balance_usdc:,.2f} | "
             f"risk/trade {self.risk.state.risk_per_trade_pct:.1%} | "
             f"daily stop ${self.risk.state.balance_usdc * self.risk.state.daily_loss_limit_pct:,.2f}"
+            + (f" | already down ${self.risk.state.daily_loss_usdc:,.2f} today"
+               if self.risk.state.daily_loss_usdc > 0 else "")
         )
+        if not self.cfg.paper_trading and self.risk.state.balance_usdc <= 0:
+            raise RuntimeError(
+                "Refusing to start LIVE with no readable account balance — "
+                "every risk limit is a percentage of it. Check CFM funding "
+                "and the Coinbase API credentials."
+            )
 
         logger.info("Running initial screener...")
         self.watchlist = await self.screener.run()
         logger.info(f"Watchlist ({len(self.watchlist)}): {self.watchlist}")
 
-        set_agent_state(self.executor, self.risk, self.screener)
+        set_agent_state(self.executor, self.risk, self.screener, self.account)
         self._api_task = asyncio.create_task(self._run_api())
         self.monitor.start()
         logger.info("✅ FastAPI + position monitor started")
@@ -191,6 +235,21 @@ class TradeBrainAgent:
     # Threshold comes from config.drought_guard_hours (hot-reloadable);
     # 0 disables the guard entirely.
 
+    async def _notify_mode_drift(self, drift: str) -> None:
+        """One alert per drift event — the loop would otherwise repeat it
+        every tick for as long as the mismatch stands."""
+        if getattr(self, "_drift_alerted", "") == drift:
+            return
+        self._drift_alerted = drift
+        try:
+            await self.notifier.notify_alert(
+                "Trading mode changed at runtime",
+                f"{drift}. Trading is paused. Restart the agent in the mode you "
+                "want, and make .env PAPER_TRADING and agent_config.paper_trading agree.",
+            )
+        except Exception as exc:
+            logger.warning(f"Mode-drift alert failed: {exc}")
+
     async def _last_trade_age_hours(self) -> float:
         try:
             val = await self.db.fetchval(
@@ -210,6 +269,17 @@ class TradeBrainAgent:
             tick_started = time.monotonic()
             try:
                 await self._tick_step("db.sync_config", self.db.sync_config())
+                # sync_config just hot-reloaded agent_config into cfg — which
+                # includes paper_trading. A flip here would have the loop
+                # routing orders down the other mode's path while every
+                # in-memory position, the paper ledger and the day's loss
+                # still belong to the mode we booted in. Pause instead; the
+                # executor refuses entries independently (belt and braces).
+                drift = trading_mode.check_boot_drift(self.cfg)
+                if drift:
+                    logger.error(f"🚫 {drift} — pausing trading until restart")
+                    self.risk.state.manual_pause = True
+                    await self._notify_mode_drift(drift)
                 await self._tick_step("risk.sync", self.risk.sync())
 
                 # Read hot-reload values fresh each iteration so UI/Burt edits
@@ -333,7 +403,10 @@ class TradeBrainAgent:
 
         signal = type("Sig", (), {"direction": "none", "confidence": 0.0})()
         skip = self.risk.check_trade_allowed(signal, product_id)
-        if skip and ("Manual pause" in skip or "Circuit breaker" in skip):
+        # Account-level blocks fail identically for every symbol and every
+        # strategy, so bail before spending candles and an LLM call on them.
+        if skip and ("Manual pause" in skip or "Circuit breaker" in skip
+                     or "balance" in skip.lower()):
             return
 
         try:
@@ -521,6 +594,18 @@ class TradeBrainAgent:
             t.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+
+        # In-flight fill audits hold a reference to the Coinbase client; let
+        # them finish (briefly) before it closes, so a just-placed order's
+        # fills still land in the audit trail on a clean shutdown.
+        audits = [t for t in getattr(self.executor, "_audit_tasks", set()) if not t.done()]
+        if audits:
+            logger.info(f"Waiting on {len(audits)} fill audit(s)...")
+            done, pending = await asyncio.wait(audits, timeout=10)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
         await self.signal_engine.close()
         await self.sentiment.close()

@@ -21,7 +21,7 @@ Burt is the agent's personality layer. He's conversational, dry, self-aware, and
 | AI Signal Evaluation (Kimi K2.6) | ✅ Working with OpenRouter |
 | Risk Manager (stops, sizing, circuit breaker) | ✅ Full implementation |
 | Paper Trading | ✅ Ready for testing |
-| Live Trading (Coinbase FCM) | ⏳ Needs futures buying power |
+| Live Trading (Coinbase FCM) | ✅ Live — real equity, real order ids, real fills |
 | Position Monitor | ✅ Full implementation |
 | Discord Bot (Burt personality) | ✅ Skeleton ready — needs `DISCORD_BOT_TOKEN` |
 | Semantic Memory (pgvector) | ✅ Full implementation |
@@ -69,13 +69,69 @@ Three built-in strategies provide signal prompts to the AI:
 2. **Bollinger Band Mean Reversion** — Fade overextension back to the mean
 3. **EMA Trend + Pullback** — Enter pullbacks to 20 EMA in strong trends
 
+## Paper vs Live (they are separate accounts)
+
+`PAPER_TRADING` in `.env` and `agent_config.paper_trading` in the DB select the
+mode, and **they must agree** — the agent refuses to start otherwise, and
+refuses to flip mode at runtime (a flip would leave open positions, the equity
+source and the day's loss budget belonging to the mode it booted in).
+
+| | PAPER | LIVE |
+|---|---|---|
+| Equity | `paper_balance` ledger in `agent_config`, updated by realized paper P&L | **Coinbase `/cfm/balance_summary`**, cached 30s (`agent/account.py`) |
+| Position sizing & daily stop | % of that ledger | % of real account equity |
+| Circuit breaker | modeled P&L of paper closes | worse of our modeled losses **and the exchange's own `daily_realized_pnl`** |
+| Trades | `trades` rows with `is_paper = TRUE` | `is_paper = FALSE`, plus real `order_id` / `client_order_id` / `stop_order_id` / `exit_order_id` and rows in `fills` |
+| Restart | open paper positions restored from `trades` | restored from `trades`, then reconciled against the exchange (exchange wins) |
+
+Every read is scoped to one book: `/api/trades`, `/api/stats`, `/api/analytics`
+and `/api/analytics/review` default to the running mode and take
+`?mode=paper|live|all`. Burt's context, the nightly consolidation and the
+weekly review are scoped the same way — blending simulated fills into live
+numbers describes an account that does not exist.
+
+A position stamped for one mode can never be **opened or reduced** while the
+agent runs in the other (`agent/trading_mode.py`). Closing is deliberately
+exempt: flattening must always work, so a mismatch is logged loudly and the
+close proceeds rather than stranding a real position.
+
+## Live Order Audit
+
+Every live order records its identity before and after the fact, so each
+`trades` row can be reconciled line-by-line against Coinbase's order history:
+
+- `client_order_id` is minted **before** the request — the only handle that
+  finds an order the exchange accepted but whose response never came back.
+- `order_id`, `stop_order_id`, `exit_order_id` are the exchange's own ids.
+- Fills land in the `fills` table (unique on Coinbase's `fill_id`, so re-syncs
+  are idempotent), and their volume-weighted price and real commission are
+  written back as `filled_entry_price` / `filled_exit_price` /
+  `exchange_fees_usdc` — kept **separate** from the bot's modeled
+  `entry_price` / `fees_usdc` so slippage and fee-model drift are visible.
+- A sweep every 10 monitor ticks catches fills the bot never saw: a protective
+  stop that triggered on its own, a position closed from the Coinbase app.
+
+```bash
+# reconcile trades placed before order-id logging existed (dry run by default)
+venv/bin/python scripts/backfill_fills.py
+venv/bin/python scripts/backfill_fills.py --apply
+```
+
+```sql
+-- modeled vs actual, per live trade
+SELECT id, entry_price, filled_entry_price, exit_price, filled_exit_price,
+       fees_usdc AS modeled_fees, exchange_fees_usdc AS actual_fees
+FROM trades WHERE is_paper = FALSE ORDER BY id DESC;
+```
+
 ## Risk Management (Non-Negotiable)
 
 - **Position sizing**: in **whole contracts** at the exchange's overnight margin rate (CFM fills whole contracts; 1 ETH PERP ≈ $260, 1 NEAR PERP ≈ $1,900). Target `risk_per_trade`, hard-capped by `max_risk_per_trade` (default 4%) and `max_margin_pct` (default 50% of balance for one position). Products whose single contract breaks either cap are dropped by the screener. Paper mode uses the same lot sizes so paper results mean something for live.
 - **Stop loss**: ATR-based (default 2.5× 15m ATR) or fixed % — placed simultaneously with entry, plus an exchange-native stop in live mode
 - **Take profit**: Configurable R:R (default 4.0); trailing stop takes over at +1.5R
 - **4h bias gate**: long only above the 4h EMA50, short only below (`require_4h_bias`)
-- **Circuit breaker**: Halts ALL trading after daily loss limit (default 5%)
+- **Circuit breaker**: Halts ALL trading after the daily loss limit (default 5% **of real account equity** in live mode). In live mode it also trips on the exchange's own realized P&L for the session, and the day's loss is re-seeded from closed trades on restart — a restart no longer hands the day a fresh loss budget.
+- **Stale balance**: live entries are refused when the last successful balance read is older than `MAX_BALANCE_STALENESS_SEC` — sizing against a balance the exchange stopped confirming is how a 1% risk becomes an unbounded one.
 - **Fees**: modeled at the measured 0.14%/fill taker rate; entries whose round-trip fee exceeds 20% of $-at-risk are rejected
 - **Min confidence**: default 0.65 to act on a signal — *tunable live from the UI or Burt*
 
@@ -202,6 +258,10 @@ If you're getting no trades in a flat market, drop **Min Confidence** to ~0.5 �
 | `DISCORD_CHANNEL_ID` | ⏳ Optional | Right-click channel → Copy ID |
 | `DISCORD_USER_ID` | ⏳ Optional | Right-click your name → Copy ID |
 
+Live-account knobs (all optional, defaults in `config.py`): `LIVE_EQUITY_SOURCE`,
+`BALANCE_REFRESH_SEC`, `MAX_BALANCE_STALENESS_SEC`, `ACCOUNT_SNAPSHOT_INTERVAL_SEC`,
+`USE_EXCHANGE_REALIZED_PNL`, `SYNC_FILLS`. See `.env.example`.
+
 ## Project Structure
 
 ```
@@ -210,6 +270,8 @@ tradebrain/
 │   ├── main.py              # Entry point, startup, main loop
 │   ├── api.py               # FastAPI backend
 │   ├── coinbase_client.py   # Native JWT Coinbase Brokerage v3 client
+│   ├── account.py           # Real account equity from /cfm/balance_summary (cached)
+│   ├── trading_mode.py      # PAPER/LIVE source of truth + mismatch guards
 │   ├── screener.py          # FCM perp universe discovery + scoring
 │   ├── indicator_engine.py  # Manual pandas TA indicators
 │   ├── signal_engine.py     # OpenRouter / Kimi K2.6 client
@@ -237,7 +299,8 @@ tradebrain/
 
 ## Safety
 
-- Paper trading is the default. Switching to live requires manual confirmation.
+- Paper trading is the default. Switching to live requires manual confirmation, and `.env` + `agent_config` must agree — the agent refuses to start on a mismatch and will not change mode while running.
+- Paper and live are fully separated: a simulated position can never be opened or reduced in live mode (or vice versa), and simulated losses can never be charged against the live daily loss budget.
 - No entry order is placed without a simultaneous stop loss order.
 - Circuit breaker halts all trading at the daily loss limit.
 - The agent runs entirely on your local machine. No cloud compute. Your keys stay local.

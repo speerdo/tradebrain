@@ -55,7 +55,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_open_positions",
-            "description": "List currently open paper positions with entry, direction, stop, take-profit.",
+            "description": ("List currently open positions (paper or live, whichever "
+                            "mode the agent is running) with entry, direction, stop, "
+                            "take-profit."),
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -186,7 +188,8 @@ TOOLS = [
         "function": {
             "name": "close_position",
             "description": (
-                "DESTRUCTIVE: close an open paper position at market. The system will "
+                "DESTRUCTIVE: close an open position at market — REAL money in live "
+                "mode. The system will "
                 "REFUSE to execute this unless the user's most recent message contains the "
                 "literal word 'confirm'. Workflow: (1) describe what you're about to close "
                 "and ask the user to reply 'confirm'; (2) on the next turn, after they "
@@ -493,7 +496,9 @@ class Burt:
             pos_lines = "  (none)"
 
         try:
-            stats = await self.db.get_today_stats()
+            stats = await self.db.get_today_stats(
+                is_paper=bool(self.cfg.paper_trading)
+            )
             stats_line = (
                 f"Today: {stats.get('wins', 0)}W/{stats.get('losses', 0)}L  "
                 f"P&L=${stats.get('pnl_today', 0):+.2f}  "
@@ -506,7 +511,27 @@ class Burt:
         cb_state = "TRIPPED" if self.risk.state.circuit_breaker_active else "ok"
         mode = "paper" if self.cfg.paper_trading else "LIVE"
         universe_line = await self._get_products_summary()
-        balance_line = f"Account balance: ${self.risk.state.balance_usdc:,.2f} (includes all realized paper P&L)"
+        # Say where the number came from. In LIVE this is the exchange's own
+        # equity, not a simulated ledger — Burt used to describe real money as
+        # "includes all realized paper P&L".
+        rs = self.risk.state
+        if self.cfg.paper_trading:
+            balance_line = (
+                f"Account balance: ${rs.balance_usdc:,.2f} "
+                "(simulated ledger — includes all realized paper P&L)"
+            )
+        else:
+            balance_line = (
+                f"Account balance: ${rs.balance_usdc:,.2f} REAL money, read from "
+                f"Coinbase ({rs.balance_source or 'unknown source'}"
+                + (f", STALE {rs.balance_age_sec / 60:.0f}m" if rs.balance_stale else "")
+                + f"). Exchange-reported realized P&L today: "
+                f"${rs.exchange_realized_pnl_usdc:+,.2f}"
+            )
+        loss_line = (
+            f"Daily loss so far: ${rs.daily_loss_usdc:,.2f} of "
+            f"${rs.balance_usdc * rs.daily_loss_limit_pct:,.2f} limit"
+        )
 
         return (
             "You are Burt, the personality and chat interface for a crypto-perps "
@@ -517,6 +542,7 @@ class Burt:
             "LIVE STATE (refreshed every turn):\n"
             f"Mode: {mode}  |  Risk: {pause_state}  |  Circuit breaker: {cb_state}\n"
             f"{balance_line}\n"
+            f"{loss_line}\n"
             f"{stats_line}\n"
             f"{universe_line}\n"
             "Open positions:\n"
@@ -547,8 +573,21 @@ class Burt:
             "  trades(id, created_at, closed_at, symbol, direction, strategy, "
             "confidence, entry_price, stop_loss, take_profit, size_usdc, margin_usdc, "
             "leverage, risk_usdc, is_paper, status, exit_price, pnl_usdc, reasoning, "
-            "order_id, signal_id, product_id, display_name, tax_treatment, product_type)\n"
+            "order_id, signal_id, product_id, display_name, tax_treatment, product_type, "
+            "fees_usdc, contracts, client_order_id, stop_order_id, exit_order_id, "
+            "filled_entry_price, filled_exit_price, filled_contracts, exchange_fees_usdc)\n"
             "    -- status is 'open' or a closed variant; pnl_usdc only set when closed\n"
+            "    -- is_paper TRUE = simulated, FALSE = real money. ALWAYS filter on it; "
+            "both books share this table and blending them is meaningless\n"
+            "    -- filled_* / exchange_fees_usdc are the EXCHANGE's actual numbers "
+            "(live only); entry_price/fees_usdc are our own modeled ones\n"
+            "  fills(id, created_at, trade_id, fill_id, order_id, client_order_id, "
+            "product_id, side, leg, price, size, commission_usdc, filled_at)\n"
+            "    -- one row per real exchange fill, for auditing against Coinbase's "
+            "order history; leg is entry/exit/partial\n"
+            "  account_snapshots(id, created_at, mode, equity_usdc, buying_power_usdc, "
+            "cash_usdc, unrealized_pnl_usdc, daily_realized_pnl_usdc, source)\n"
+            "    -- periodic real account equity; mode is 'LIVE' or 'PAPER'\n"
             "  signals(id, created_at, symbol, direction, strategy, confidence, "
             "reasoning, acted_on, skip_reason, rsi_15m, macd_hist_15m, atr_15m, price)\n"
             "    -- one row per screened symbol per loop iteration; acted_on=true means "

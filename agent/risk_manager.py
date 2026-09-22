@@ -10,12 +10,15 @@ from typing import Any
 from loguru import logger
 
 import config
+from agent import trading_mode
 
 
 @dataclass
 class RiskParams:
     """Dynamic risk state (updated from DB hot-reload)."""
-    balance_usdc: float = 100_000.0  # default dummy balance (updated in real run)
+    # Placeholder only — _sync_balance replaces this on the first tick with
+    # the paper ledger or, in live mode, the exchange's own equity.
+    balance_usdc: float = 0.0
     leverage: int = 3
     risk_per_trade_pct: float = 0.01
     daily_loss_limit_pct: float = 0.05
@@ -31,6 +34,16 @@ class RiskParams:
     circuit_breaker_active: bool = False
     daily_loss_usdc: float = 0.0
     manual_pause: bool = False
+    # --- Account provenance (live mode) ---
+    # Where balance_usdc came from and how old it is. Sizing a position
+    # against a number the exchange stopped confirming is how a 1% risk
+    # quietly becomes an unbounded one, so entries are blocked while stale.
+    balance_source: str = ""
+    balance_stale: bool = False
+    balance_age_sec: float = 0.0
+    # The exchange's own realized P&L for the session (live only). The
+    # breaker trips on whichever is worse: this, or our modeled losses.
+    exchange_realized_pnl_usdc: float = 0.0
     # --- Portfolio-level risk (B3) ---
     max_concurrent_positions: int = 3
     max_total_risk_pct: float = 0.03         # cap total open $-at-risk at 3% of balance
@@ -362,6 +375,14 @@ class RiskManager:
         self._last_reset_day = int(time.time() / 86400)
         # Trailing closed-trade PnLs for drawdown-scaled sizing (B3)
         self._recent_pnl: deque[tuple[float, float]] = deque(maxlen=200)  # (ts, pnl)
+        # Losses this session, booked by apply_loss. Kept separate from
+        # state.daily_loss_usdc because in live mode that field is the WORSE
+        # of this and the exchange's own realized P&L — mixing the two into
+        # one accumulator would double-count every close the exchange also
+        # reports.
+        self._session_loss_usdc: float = 0.0
+        self._seeded_daily_loss = False
+        self._account: Any = None
 
     # ------------------------------------------------------------------
     # Sync from DB / UI
@@ -375,38 +396,108 @@ class RiskManager:
         """Wire the exchange client so live mode can read the real balance."""
         self._cb = cb
 
+    def set_account(self, account: Any) -> None:
+        """Wire the AccountService — the one reader of /cfm/balance_summary."""
+        self._account = account
+
     async def _sync_balance(self) -> None:
         """
-        Keep balance_usdc real.
+        Keep balance_usdc real — from the EXCHANGE in live mode.
 
-        Every position size, the total-risk cap, the drawdown scale, and the
-        circuit-breaker threshold are percentages of this number. It used to be
-        hardcoded at 100_000 with a comment claiming it was "updated in a real
-        run" — nothing updated it, so a $200 paper account sized trades for a
-        $100k one and put the daily loss limit at $5,000.
+        Every position size, the total-risk cap, the drawdown scale and the
+        circuit-breaker threshold are percentages of this number, so in live
+        mode it has to be the account's actual equity, not the paper ledger.
+        `AccountService` owns the fetch (and its cache); this just adopts the
+        result and records where it came from, so a stale balance can block
+        new entries instead of silently sizing against a guess.
         """
-        if self.cfg.paper_trading:
+        if self._account is None:
+            # No account service wired (unit tests, backtests): fall back to
+            # the paper ledger rather than the old 100k placeholder.
             bal = float(self.cfg.paper_balance or 0)
-            if bal > 0 and bal != self.state.balance_usdc:
-                logger.info(f"Paper balance set to ${bal:,.2f}")
+            if bal > 0:
                 self.state.balance_usdc = bal
             return
-        cb = getattr(self, "_cb", None)
-        if cb is None:
+
+        snap = await self._account.get()
+        self.state.balance_source = snap.source
+        self.state.balance_stale = snap.stale
+        self.state.balance_age_sec = snap.age_sec
+        self.state.exchange_realized_pnl_usdc = snap.daily_realized_pnl_usdc
+
+        if snap.equity_usdc > 0 and abs(snap.equity_usdc - self.state.balance_usdc) > 0.01:
+            logger.info(
+                f"{snap.mode} balance: ${self.state.balance_usdc:,.2f} → "
+                f"${snap.equity_usdc:,.2f} [{snap.source}]"
+            )
+        if snap.equity_usdc > 0:
+            self.state.balance_usdc = snap.equity_usdc
+
+    def balance_is_usable(self) -> str:
+        """
+        Returns "" when the balance is fresh enough to size new risk against,
+        otherwise the reason it is not.
+        """
+        if self.cfg.paper_trading:
+            return ""
+        max_age = float(getattr(self.cfg, "max_balance_staleness_sec", 0) or 0)
+        if self.state.balance_usdc <= 0:
+            return "Live account balance unknown (no successful balance read yet)"
+        if max_age > 0 and self.state.balance_stale and self.state.balance_age_sec > max_age:
+            return (
+                f"Live balance is stale ({self.state.balance_age_sec / 60:.0f}m old, "
+                f"limit {max_age / 60:.0f}m) — refusing to size new risk"
+            )
+        return ""
+
+    async def _sync_exchange_realized_pnl(self) -> None:
+        """
+        Trip the circuit breaker on the LIVE account's realized P&L.
+
+        Our own accumulator only sees closes the bot performed. The exchange
+        sees everything: a protective stop that filled while the process was
+        down, a position closed from the Coinbase app, a liquidation. In live
+        mode the day's loss is the worse of the two — never the smaller.
+        """
+        if self.cfg.paper_trading or not self.cfg.use_exchange_realized_pnl:
+            self.state.daily_loss_usdc = self._session_loss_usdc
             return
+        exchange_loss = max(0.0, -float(self.state.exchange_realized_pnl_usdc or 0.0))
+        previous = self.state.daily_loss_usdc
+        self.state.daily_loss_usdc = max(self._session_loss_usdc, exchange_loss)
+        if self.state.daily_loss_usdc > previous + 0.005:
+            self._check_breaker(
+                source="exchange" if exchange_loss > self._session_loss_usdc else "local"
+            )
+
+    async def seed_daily_loss(self) -> None:
+        """
+        Re-seed today's loss from durable state at startup.
+
+        The breaker's counter is in-memory: a restart used to hand the day a
+        fresh 5% loss budget, so three restarts meant three daily limits. In
+        live mode the exchange's realized P&L covers this; in paper mode the
+        closed trades booked since midnight do.
+        """
+        if self._seeded_daily_loss:
+            return
+        self._seeded_daily_loss = True
         try:
-            summary = await cb.get_futures_balance_summary()
-            bs = summary.get("balance_summary", summary) or {}
-            for key in ("cfm_usd_balance", "total_usd_balance", "futures_buying_power"):
-                raw = bs.get(key)
-                val = float(raw.get("value")) if isinstance(raw, dict) else float(raw or 0)
-                if val > 0:
-                    if abs(val - self.state.balance_usdc) > 0.01:
-                        logger.info(f"Live balance synced from exchange ({key}): ${val:,.2f}")
-                    self.state.balance_usdc = val
-                    return
+            from agent.database import get_db
+            db = await get_db()
+            realized = await db.get_realized_pnl_today(bool(self.cfg.paper_trading))
         except Exception as exc:
-            logger.warning(f"Balance sync failed — keeping ${self.state.balance_usdc:,.2f}: {exc}")
+            logger.warning(f"Could not seed today's realized P&L: {exc}")
+            return
+        loss = max(0.0, -realized)
+        if loss > 0:
+            self._session_loss_usdc = max(self._session_loss_usdc, loss)
+            self.state.daily_loss_usdc = max(self.state.daily_loss_usdc, loss)
+            logger.info(
+                f"Daily loss seeded from closed {trading_mode.current_mode(self.cfg)} "
+                f"trades since midnight: ${loss:,.2f}"
+            )
+            self._check_breaker(source="restart-seed")
 
     async def sync(self) -> None:
         """Called at top of each signal loop iteration, right after
@@ -446,10 +537,16 @@ class RiskManager:
         # Midnight UTC circuit breaker reset
         current_day = int(time.time() / 86400)
         if current_day > self._last_reset_day:
+            self._session_loss_usdc = 0.0
             self.state.daily_loss_usdc = 0.0
             self.state.circuit_breaker_active = False
             self._last_reset_day = current_day
             logger.info("Circuit breaker auto-reset (midnight UTC)")
+
+        # Live: fold the exchange's own realized P&L into the day's loss.
+        # Runs AFTER the midnight reset so a fresh day starts from the
+        # exchange's fresh number, not yesterday's.
+        await self._sync_exchange_realized_pnl()
 
     # ------------------------------------------------------------------
     # Pre-trade checks
@@ -468,6 +565,11 @@ class RiskManager:
             return "Manual pause is active"
         if self.state.circuit_breaker_active:
             return "Circuit breaker active"
+        # Live only: never size a new position against a balance the
+        # exchange has stopped confirming.
+        balance_problem = self.balance_is_usable()
+        if balance_problem:
+            return balance_problem
         if signal.direction == "none":
             return "No directional signal"
         if signal.confidence < self.state.min_confidence:
@@ -543,14 +645,27 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def apply_loss(self, pnl_usdc: float, symbol: str = "",
-                   pnl_r: float = 0.0) -> None:
+                   pnl_r: float = 0.0, is_paper: bool | None = None) -> None:
         """
         Record a closed trade's PnL. Updates circuit breaker, protections,
         and drawdown tracking.
 
         `pnl_r` is the PnL in R-multiples (pnl / initial $-at-risk) — used by
         the LosingSymbolLock. Pass 0.0 if unknown (no R-based protection trip).
+
+        `is_paper` is the closed position's own mode. A close from the other
+        book never touches this account's loss budget: simulated losses must
+        not trip a live breaker, and live losses must not be absorbed by a
+        paper one.
         """
+        if is_paper is not None and bool(is_paper) is not bool(self.cfg.paper_trading):
+            logger.error(
+                f"🚫 Ignoring {trading_mode.mode_of(bool(is_paper))} close of "
+                f"{symbol or 'unknown'} (P&L ${pnl_usdc:+.2f}) for risk accounting — "
+                f"agent is {trading_mode.current_mode(self.cfg)}"
+            )
+            return
+
         # Track for drawdown-scaled sizing (B3)
         self._recent_pnl.append((time.time(), pnl_usdc))
 
@@ -563,19 +678,38 @@ class RiskManager:
 
         if pnl_usdc >= 0:
             return
-        self.state.daily_loss_usdc += abs(pnl_usdc)
+        self._session_loss_usdc += abs(pnl_usdc)
+        # In live mode the exchange's realized P&L may already be worse than
+        # our own tally (a stop that filled while we were down); never let
+        # this overwrite the larger number with the smaller one.
+        self.state.daily_loss_usdc = max(
+            self.state.daily_loss_usdc, self._session_loss_usdc
+        )
+        self._check_breaker(source="local")
+
+    def _check_breaker(self, source: str = "local") -> None:
+        """Trip the breaker if the day's loss has reached the limit.
+
+        The limit is a percentage of `balance_usdc`, which in live mode is
+        the exchange's equity — so the daily stop is a real fraction of real
+        funds, not of a paper ledger."""
+        if self.state.circuit_breaker_active or self.state.balance_usdc <= 0:
+            return
         limit = self.state.balance_usdc * self.state.daily_loss_limit_pct
-        if self.state.daily_loss_usdc >= limit:
-            self.state.circuit_breaker_active = True
-            # The breaker halts all trading — it is the single most important
-            # thing to be told about, and it had no notification path at all.
-            self._notify_circuit_breaker(limit)
-            logger.error(
-                f"╔══════════════════════════════════════╗\n"
-                f"║   CIRCUIT BREAKER TRIGGERED          ║\n"
-                f"║   Daily loss: ${self.state.daily_loss_usdc:.2f} >= ${limit:.2f}   ║\n"
-                f"╚══════════════════════════════════════╝"
-            )
+        if self.state.daily_loss_usdc < limit:
+            return
+        self.state.circuit_breaker_active = True
+        # The breaker halts all trading — it is the single most important
+        # thing to be told about, and it had no notification path at all.
+        self._notify_circuit_breaker(limit)
+        logger.error(
+            f"╔══════════════════════════════════════╗\n"
+            f"║   CIRCUIT BREAKER TRIGGERED          ║\n"
+            f"║   Daily loss: ${self.state.daily_loss_usdc:.2f} >= ${limit:.2f}   ║\n"
+            f"╚══════════════════════════════════════╝\n"
+            f"   mode={trading_mode.current_mode(self.cfg)} source={source} "
+            f"balance=${self.state.balance_usdc:,.2f} [{self.state.balance_source}]"
+        )
 
     def _notify_circuit_breaker(self, limit: float) -> None:
         """Fire-and-forget Discord alert. apply_loss is sync and is called from
@@ -592,9 +726,20 @@ class RiskManager:
             logger.warning("Circuit breaker alert not sent — no running event loop")
 
     def reset_circuit_breaker(self) -> None:
+        self._session_loss_usdc = 0.0
         self.state.daily_loss_usdc = 0.0
         self.state.circuit_breaker_active = False
         logger.info("Circuit breaker MANUALLY reset")
+        if not self.cfg.paper_trading and self.cfg.use_exchange_realized_pnl:
+            # The next sync re-reads the exchange's realized P&L for the
+            # session, which has not been reset — say so rather than let the
+            # breaker appear to re-trip on its own a tick later.
+            logger.warning(
+                "Live mode: the exchange still reports "
+                f"${self.state.exchange_realized_pnl_usdc:+,.2f} realized today — "
+                "the breaker will re-arm on the next sync unless that improves. "
+                "Set use_exchange_realized_pnl=false to override."
+            )
 
     # ------------------------------------------------------------------
     # Helpers

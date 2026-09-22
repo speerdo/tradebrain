@@ -80,12 +80,20 @@ class PositionMonitor:
 
     CHECK_INTERVAL = 30
 
+    # Full fill re-sync cadence, in monitor ticks. The per-order audit in the
+    # executor covers orders the bot placed; this sweep catches what it can't
+    # see — a protective stop that filled on its own, a close from the
+    # Coinbase app — so `fills` stays a faithful mirror of the exchange's
+    # history without a request every 30 seconds.
+    FILL_SYNC_EVERY_N_TICKS = 10
+
     def __init__(self, executor: Executor, cb: CoinbaseClient, risk: RiskManager):
         self.executor = executor
         self.cb = cb
         self.risk = risk
         self._task: asyncio.Task | None = None
         self._running = False
+        self._tick = 0
         # Track per-position ATR at entry + original stop for R-multiple + trailing
         self._pos_meta: dict[str, dict] = {}  # product_id -> {atr, original_stop, original_size, partial_done}
 
@@ -119,10 +127,13 @@ class PositionMonitor:
             await asyncio.sleep(self.CHECK_INTERVAL)
 
     async def _check(self) -> None:
+        self._tick += 1
         # Live mode: reconcile from the exchange every tick — it is the
         # source of truth for what is actually open.
         if not self.executor.cfg.paper_trading:
             await self.executor.reconcile_live_positions()
+            if self._tick % self.FILL_SYNC_EVERY_N_TICKS == 0:
+                await self.executor.sync_recent_fills()
 
         positions = self.executor.get_open_positions()
         if not positions:
@@ -361,7 +372,8 @@ class PositionMonitor:
         risk_usd = (stop_distance / pos.entry_price) * original_size if pos.entry_price else 0
         pnl_r = exit_pnl / risk_usd if risk_usd > 0 else 0.0
 
-        self.risk.apply_loss(exit_pnl, symbol=pos.product_id, pnl_r=pnl_r)
+        self.risk.apply_loss(exit_pnl, symbol=pos.product_id, pnl_r=pnl_r,
+                             is_paper=pos.is_paper)
         await self._notify(pos, snap)
 
     async def _notify(self, pos: PaperPosition, snap: PositionSnapshot) -> None:
