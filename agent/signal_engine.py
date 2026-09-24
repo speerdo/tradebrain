@@ -6,6 +6,7 @@ returns SignalResult. Everything is logged to DB regardless of outcome.
 """
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -22,7 +23,8 @@ OPENROUTER_EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings"
 SYSTEM_PROMPT = """\
 You are TradeBrain, an expert crypto futures trading signal evaluator.
 You analyze live technical indicator data and determine whether a trading
-signal meets the defined strategy criteria for a leveraged position on Hyperliquid.
+signal meets the defined strategy criteria for a leveraged perpetual-futures
+position on Coinbase Financial Markets (CFM).
 
 Rules:
 - Only signal "long" or "short" when ALL required conditions are clearly met
@@ -46,6 +48,9 @@ class SignalEngine:
         if not self._available:
             logger.warning("SignalEngine: no usable run-plane credential for the signal role — evaluation disabled")
         self._memory_engine = None  # wired in by main.py for C5 memory loop
+        # (symbol, strategy) -> bar_time of the last bar a directional rule
+        # signal was handed on for. Bar-based strategies act once per bar.
+        self._consumed_bars: dict[tuple[str, str], float] = {}
 
     def _signal_route_usable(self) -> bool:
         """Signal evaluation works when its route has a key, or routes to
@@ -92,42 +97,98 @@ class SignalEngine:
     # Signal evaluation
     # ------------------------------------------------------------------
 
+    BAR_SECONDS = 4 * 3600      # bar_time is the start of a 4h bar
+    MAX_SIGNAL_AGE_H = 1.0
+
     async def evaluate(self, symbol: str, strategy: BaseStrategy,
                        indicators: dict, regime: dict | None = None,
                        extra_context: str = "") -> SignalResult:
         """
-        Run full LLM evaluation for one symbol + strategy.
-        Falls back to "none" signal if key missing / API error / parse failure.
+        Rules first, LLM as a veto.
+
+        `strategy.check_entry` — the same deterministic rule the backtester
+        replays — decides whether there is a setup at all. Only when it fires
+        is the LLM asked, and the LLM can only agree (possibly lowering the
+        confidence) or veto; it can never originate a trade. Before
+        2026-09-24 this ran the other way round: the LLM was called on every
+        tick for every symbol (~400 calls/day on ETH alone) and picked the
+        direction, with the rules only able to veto it — so no backtest was
+        measuring the system that traded.
+
+        An LLM error or unparseable reply fails OPEN (the rule's signal
+        stands): the rule is the tested part, the LLM filter is not. Set
+        config.llm_veto=false to skip the LLM entirely.
 
         `extra_context` is a pre-formatted string (derivatives + sentiment blocks)
         appended to the prompt after the strategy fragment.
         """
-        llm_response = {"direction": "none", "confidence": 0.0}
+        rule = strategy.check_entry(indicators)
+        if rule.entry_price is None:
+            rule.entry_price = indicators.get("15m", {}).get("price")
+        if rule.direction == "none":
+            rule.skip_reason = "No rule setup"
+            rule.signal_id = await self._log_signal(symbol, strategy.name, rule, indicators, model=None)
+            return rule
 
-        if self._available:
-            try:
-                llm_response = await self._call_llm(symbol, strategy, indicators, regime, extra_context)
-            except Exception as exc:
-                logger.error(f"LLM call failed for {symbol}: {exc}")
-                llm_response = {
-                    "direction": "none", "confidence": 0.0,
-                    "parse_failed": True,
-                    "raw_response_snippet": f"LLM error: {exc}"[:200],
-                }
+        if rule.bar_time is not None:
+            key = (symbol, strategy.name)
+            # A breakout bar stays "true" for the 4 hours until the next one
+            # closes; act on it once (the backtest enters at the bar close),
+            # not on every tick — and not at all if we only noticed it late
+            # (e.g. after a restart), when the fill would be hours off the
+            # price that was tested.
+            if self._consumed_bars.get(key) == rule.bar_time:
+                return SignalResult(direction="none", entry_price=rule.entry_price,
+                                    bar_time=rule.bar_time,
+                                    skip_reason="No rule setup (bar already acted on)")
+            self._consumed_bars[key] = rule.bar_time
+            age_h = (time.time() - (rule.bar_time + self.BAR_SECONDS)) / 3600
+            if age_h > self.MAX_SIGNAL_AGE_H:
+                rule.direction = "none"
+                rule.skip_reason = f"No rule setup (breakout bar closed {age_h:.1f}h ago — stale)"
+                rule.signal_id = await self._log_signal(symbol, strategy.name, rule, indicators, model=None)
+                return rule
 
-        # Strategy may apply its own hard gates on top of LLM output
-        signal = strategy.parse_response(llm_response, indicators)
-        # Preserve the parse-failure marker through the strategy gate so the
-        # signals table can distinguish "no signal" from "unparseable output".
-        signal.parse_failed = bool(llm_response.get("parse_failed", False))
-        signal.raw_response_snippet = str(llm_response.get("raw_response_snippet") or "")
+        if not (self._available and self.cfg.llm_veto):
+            rule.signal_id = await self._log_signal(symbol, strategy.name, rule, indicators, model=None)
+            return rule
 
-        # Override with LLM-derived entry price if strategy didn't provide one
-        if signal.entry_price is None:
-            signal.entry_price = indicators.get("15m", {}).get("price")
+        try:
+            llm_response = await self._call_llm(symbol, strategy, indicators, regime, extra_context)
+        except Exception as exc:
+            logger.error(f"LLM call failed for {symbol}: {exc}")
+            llm_response = {
+                "direction": "none", "confidence": 0.0,
+                "parse_failed": True,
+                "raw_response_snippet": f"LLM error: {exc}"[:200],
+            }
 
-        # Log to DB
-        await self._log_signal(symbol, strategy.name, signal, indicators)
+        if llm_response.get("parse_failed"):
+            logger.warning(
+                f"{symbol} [{strategy.name}]: LLM veto unavailable (error/unparseable) — "
+                f"rule signal {rule.direction} stands"
+            )
+            rule.parse_failed = True
+            rule.raw_response_snippet = str(llm_response.get("raw_response_snippet") or "")
+            rule.signal_id = await self._log_signal(symbol, strategy.name, rule, indicators)
+            return rule
+
+        # The strategy re-applies its hard gates to whatever the LLM said.
+        llm_sig = strategy.parse_response(llm_response, indicators)
+        if llm_sig.direction != rule.direction:
+            signal = SignalResult(
+                direction="none", confidence=llm_sig.confidence,
+                reasoning=llm_sig.reasoning or rule.reasoning,
+                entry_price=rule.entry_price, bar_time=rule.bar_time,
+                skip_reason=f"LLM veto of rule {rule.direction}",
+            )
+            logger.info(f"{symbol} [{strategy.name}]: LLM vetoed rule {rule.direction} — {signal.reasoning[:150]}")
+        else:
+            signal = rule
+            signal.confidence = llm_sig.confidence
+            signal.reasoning = llm_sig.reasoning or rule.reasoning
+            signal.invalidation = llm_sig.invalidation
+        signal.signal_id = await self._log_signal(symbol, strategy.name, signal, indicators)
         return signal
 
     async def _call_llm(self, symbol: str, strategy: BaseStrategy,
@@ -231,29 +292,37 @@ class SignalEngine:
             "raw_response_snippet": text[:200],
         }
 
+    _MODEL_UNSET = object()
+
     async def _log_signal(self, symbol: str, strategy_name: str,
-                          signal: SignalResult, indicators: dict) -> None:
+                          signal: SignalResult, indicators: dict,
+                          model: Any = _MODEL_UNSET) -> int | None:
+        """Write the signals row; returns its id so main.py can record the
+        outcome. `model=None` marks a row the LLM never saw."""
         i15 = indicators.get("15m", {})
+        if model is self._MODEL_UNSET:
+            model = self.cfg.signal_model if self._available else None
         try:
             db = await get_db()
-            await db.log_signal({
+            return await db.log_signal({
                 "symbol": symbol,
                 "direction": signal.direction,
                 "strategy": strategy_name,
                 "confidence": signal.confidence,
                 "reasoning": signal.reasoning,
                 "acted_on": False,
-                "skip_reason": "",
+                "skip_reason": signal.skip_reason,
                 "rsi_15m": i15.get("rsi"),
                 "macd_hist_15m": i15.get("macd_hist"),
                 "atr_15m": i15.get("atr"),
                 "price": i15.get("price"),
-                "model": self.cfg.signal_model if self._available else None,
+                "model": model,
                 "parse_failed": signal.parse_failed,
                 "raw_response_snippet": signal.raw_response_snippet or None,
             })
         except Exception as exc:
             logger.warning(f"Failed to log signal: {exc}")
+            return None
 
     # ------------------------------------------------------------------
     # Embeddings (for Burt semantic memory)

@@ -29,7 +29,9 @@ from agent.coinbase_client import CoinbaseClient
 from agent.database import get_db
 from agent.derivatives import DerivativesContext
 from agent.executor import Executor
-from agent.indicator_engine import compute_indicators, compute_4h_indicators, aggregate_candles
+from agent.indicator_engine import (
+    aggregate_candles, compute_4h_indicators, compute_indicators, compute_trend_4h,
+)
 from agent.maintenance import MaintenanceWindow
 from agent.memory_engine import MemoryEngine
 from agent.notifier import Notifier
@@ -74,6 +76,9 @@ class TradeBrainAgent:
         # equity comes from the persistent ledger through the same interface.
         self.risk.set_account(self.account)
         self.watchlist: list[str] = []
+        # product_id -> (fetched_at, 2h candle DataFrame) for strategies that
+        # need more 4h history than one candles request returns.
+        self._2h_history: dict[str, tuple[float, "pd.DataFrame"]] = {}
         self._shutdown = asyncio.Event()
         self._api_task = None
         self._burt_task = None
@@ -428,6 +433,14 @@ class TradeBrainAgent:
                 df_4h = aggregate_candles(df_2h, factor=2)
                 indicators["4h"] = compute_4h_indicators(df_4h)
 
+            # 4h trend context (trend_4h): the latest CLOSED UTC-aligned 4h
+            # bar with Donchian/EMA200/ATR. Needs ~300 4h bars, so it keeps a
+            # longer 2h history than the single request above.
+            if any(s.needs_4h_history for s in strategies):
+                hist = await self._get_2h_history(product_id, candles_2h)
+                if hist is not None and not hist.empty:
+                    indicators["4h_trend"] = compute_trend_4h(hist, now_ts=time.time())
+
             # C3: Fetch derivatives context (funding + OI deltas) — symbol-level,
             # shared across every candidate strategy this tick.
             deriv_ctx = await self.derivatives.get_context(product_id)
@@ -452,15 +465,21 @@ class TradeBrainAgent:
                 return
 
             for strategy in strategies:
+                policy = strategy.policy
                 sig = await self.signal_engine.evaluate(
                     product_id, strategy, indicators,
                     regime=regime_ctx,
                     extra_context=extra_context,
                 )
                 open_positions = self.executor.get_open_positions()
-                skip = self.risk.check_trade_allowed(sig, product_id, open_positions)
+                skip = self.risk.check_trade_allowed(
+                    sig, product_id, open_positions,
+                    losing_symbol_lock=policy is None or policy.losing_symbol_lock,
+                )
                 if skip:
                     logger.info(f"Skip {product_id} [{strategy.name}]: {skip}")
+                    if sig.direction != "none":
+                        await self._record_outcome(sig, skip)
                     if skip.startswith(self._RETRYABLE_SKIP_PREFIXES):
                         continue
                     return
@@ -470,6 +489,7 @@ class TradeBrainAgent:
                     fund_skip = self.derivatives.check_funding_rule(sig.direction, deriv_ctx)
                     if fund_skip:
                         logger.info(f"Skip {product_id} [{strategy.name}]: {fund_skip}")
+                        await self._record_outcome(sig, fund_skip)
                         continue
 
                 # Per-symbol trend filter (log-driven, 2026-09-01..10): every
@@ -478,21 +498,24 @@ class TradeBrainAgent:
                 # individual symbol's trend. Mechanically block counter-trend
                 # entries; the signal's entry_price may be a level the LLM wants
                 # to see filled, so compare the CURRENT price instead.
+                # Strategies with their own trend definition (TradePolicy
+                # legacy_trend_filters=False) skip this and the 4h gate below.
+                legacy_filters = policy is None or policy.legacy_trend_filters
                 i_1h = indicators.get("1h", {})
                 trend_price = i_1h.get("price")
                 trend_ema = i_1h.get("ema50")
-                if trend_price and trend_ema:
+                if legacy_filters and trend_price and trend_ema:
                     if sig.direction == "long" and trend_price < trend_ema:
-                        logger.info(
-                            f"Skip {product_id} [{strategy.name}]: trend filter — long "
-                            f"blocked, 1h price {trend_price:.4f} < EMA50 {trend_ema:.4f}"
-                        )
+                        reason = (f"trend filter — long blocked, 1h price {trend_price:.4f} "
+                                  f"< EMA50 {trend_ema:.4f}")
+                        logger.info(f"Skip {product_id} [{strategy.name}]: {reason}")
+                        await self._record_outcome(sig, reason)
                         continue
                     if sig.direction == "short" and trend_price > trend_ema:
-                        logger.info(
-                            f"Skip {product_id} [{strategy.name}]: trend filter — short "
-                            f"blocked, 1h price {trend_price:.4f} > EMA50 {trend_ema:.4f}"
-                        )
+                        reason = (f"trend filter — short blocked, 1h price {trend_price:.4f} "
+                                  f"> EMA50 {trend_ema:.4f}")
+                        logger.info(f"Skip {product_id} [{strategy.name}]: {reason}")
+                        await self._record_outcome(sig, reason)
                         continue
 
                 # Hard 4h-bias gate. Every prompt's decision tree starts with
@@ -501,12 +524,16 @@ class TradeBrainAgent:
                 # 4h step. Backtested 2026-09-18 (see backtest/engine.py
                 # require_4h_bias) — enforce it mechanically.
                 i_4h = indicators.get("4h", {})
-                if self.cfg.require_4h_bias and i_4h.get("price_vs_ema50"):
+                if legacy_filters and self.cfg.require_4h_bias and i_4h.get("price_vs_ema50"):
                     if sig.direction == "long" and i_4h["price_vs_ema50"] != "above":
-                        logger.info(f"Skip {product_id} [{strategy.name}]: 4h bias filter — long blocked, 4h below EMA50")
+                        reason = "4h bias filter — long blocked, 4h below EMA50"
+                        logger.info(f"Skip {product_id} [{strategy.name}]: {reason}")
+                        await self._record_outcome(sig, reason)
                         continue
                     if sig.direction == "short" and i_4h["price_vs_ema50"] != "below":
-                        logger.info(f"Skip {product_id} [{strategy.name}]: 4h bias filter — short blocked, 4h above EMA50")
+                        reason = "4h bias filter — short blocked, 4h above EMA50"
+                        logger.info(f"Skip {product_id} [{strategy.name}]: {reason}")
+                        await self._record_outcome(sig, reason)
                         continue
 
                 entry = sig.entry_price or indicators["15m"]["price"]
@@ -518,11 +545,19 @@ class TradeBrainAgent:
                     logger.warning(
                         f"Skip {product_id} [{strategy.name}]: no contract spec from screener"
                     )
+                    await self._record_outcome(sig, "no contract spec from screener")
                     return
+                if policy is not None and policy.atr_timeframe == "4h":
+                    stop_atr = indicators.get("4h_trend", {}).get("atr")
+                else:
+                    stop_atr = indicators["15m"]["atr"]
                 sl, tp, notional, margin, risk_usdc, contracts = self.risk.calculate_trade_params(
-                    sig.direction, entry, indicators["15m"]["atr"], spec=spec,
+                    sig.direction, entry, stop_atr, spec=spec,
+                    atr_mult=policy.stop_atr_mult if policy else None,
+                    take_profit_rr=policy.take_profit_rr if policy else None,
                 )
                 if notional <= 0 or margin <= 0 or contracts < 1:
+                    await self._record_outcome(sig, "sizing rejected (see log: contract risk / margin / fee caps)")
                     continue
 
                 result = await self.executor.enter_position(
@@ -540,20 +575,74 @@ class TradeBrainAgent:
                     confidence=sig.confidence,
                     reasoning=sig.reasoning,
                     contracts=contracts,
+                    signal_id=sig.signal_id,
                 )
                 if result.success:
                     self.risk.protections.record_entry()
+                    await self._record_outcome(sig, "", acted_on=True)
                     # get_position only tracks paper positions — None in live mode
                     pos = self.executor.get_position(product_id)
                     if pos is not None:
-                        self.monitor.record_entry(pos, indicators["15m"]["atr"])
+                        self.monitor.record_entry(pos, stop_atr)
                     logger.info(f"✅ Position opened: {product_id} {sig.direction} [{strategy.name}]")
                 else:
+                    await self._record_outcome(sig, f"entry failed: {result.error}")
                     logger.warning(f"Failed to open {product_id} [{strategy.name}]: {result.error}")
                 return  # entry attempted (success or hard failure) — done with this symbol
 
         except Exception as exc:
             logger.error(f"Error evaluating {product_id}: {exc}")
+
+    async def _record_outcome(self, sig, skip_reason: str, acted_on: bool = False) -> None:
+        """Write what became of a directional signal back to its signals row."""
+        try:
+            await self.db.update_signal_outcome(
+                getattr(sig, "signal_id", None), acted_on=acted_on, skip_reason=skip_reason,
+            )
+        except Exception as exc:
+            logger.warning(f"Could not record signal outcome: {exc}")
+
+    # 2h bars kept for the 4h trend: 1200 = 600 4h bars = 100 days, twice
+    # the ~300 4h bars EMA200 needs. Refetched in full every few hours so a
+    # missed bar can't linger; otherwise topped up from each tick's request.
+    _2H_HISTORY_BARS = 1200
+    _2H_FULL_REFRESH_S = 6 * 3600
+
+    async def _get_2h_history(self, product_id: str, latest: list):
+        import pandas as pd
+        now = time.time()
+        cached = self._2h_history.get(product_id)
+        if cached is None or now - cached[0] > self._2H_FULL_REFRESH_S:
+            candles: dict[int, object] = {}
+            end = int(now)
+            page = 300 * 7200
+            try:
+                while len(candles) < self._2H_HISTORY_BARS:
+                    batch = await self.cb.get_candles(
+                        product_id, "TWO_HOUR", start=end - page, end=end,
+                    )
+                    if not batch:
+                        break
+                    for c in batch:
+                        candles[c.start] = c
+                    end -= page
+            except Exception as exc:
+                logger.warning(f"2h history fetch failed for {product_id}: {exc}")
+                if cached is None:
+                    return None
+                candles = {}
+            if candles:
+                df = self._candles_to_df(sorted(candles.values(), key=lambda c: c.start))
+                cached = (now, df)
+                self._2h_history[product_id] = cached
+                logger.info(f"4h trend history for {product_id}: {len(df)} 2h bars since {df['time'].iloc[0]}")
+        fetched_at, df = cached
+        if latest:
+            fresh = self._candles_to_df(latest)
+            df = (pd.concat([df, fresh]).drop_duplicates("time", keep="last")
+                  .sort_values("time").tail(self._2H_HISTORY_BARS + 50).reset_index(drop=True))
+            self._2h_history[product_id] = (fetched_at, df)
+        return df
 
     @staticmethod
     def _extract_currency(product_id: str) -> str:

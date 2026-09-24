@@ -164,6 +164,7 @@
 							{@render indicator('strategy')}
 						</div>
 						<select value={val('strategy')} onchange={(e) => commit('strategy', e.currentTarget.value)}>
+							<option value="trend_4h">4h Trend (Donchian, chandelier exit)</option>
 							<option value="rsi_macd">RSI + MACD (momentum)</option>
 							<option value="bollinger">Bollinger (mean reversion)</option>
 							<option value="ema_pullback">EMA Pullback (trend continuation)</option>

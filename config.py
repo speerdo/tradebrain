@@ -79,6 +79,11 @@ class Config(BaseModel):
     # signal_interval, where every tick spends one LLM call per symbol.
     screener_interval_h: float = Field(default=1.0)
     min_confidence: float = Field(default=0.65)
+    # Ask the LLM to confirm or veto a setup the strategy's rules already
+    # found (signal_engine.evaluate). Off = trade the backtested rules alone.
+    # The veto is unvalidated — the signals table records every veto so its
+    # value can be measured before anyone relies on it.
+    llm_veto: bool = Field(default=True)
     # 2026-09-18: 1.5 -> 3.0. Sweep of 768 backtests (BTC/ETH/NEAR x
     # donchian/rsi_macd, real 0.14% fees): expectancy improves MONOTONICALLY
     # with stop width for both strategies (rsi_macd avgR -0.85 at 1.5x ->

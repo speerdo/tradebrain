@@ -35,7 +35,7 @@ from loguru import logger
 import config
 from agent.coinbase_client import CoinbaseClient
 from backtest.data_loader import load_pair
-from backtest.engine import BacktestEngine, BacktestConfig
+from backtest.engine import BacktestEngine, BacktestConfig, apply_policy
 from backtest.run import resolve_symbol
 from strategies import STRATEGIES
 from strategies.base import BaseStrategy
@@ -154,7 +154,15 @@ def run_walk_forward(
     n_folds: int = 6,
     metric: str = "profit_factor",
 ) -> WalkForwardResult:
-    param_grid = param_grid or DEFAULT_PARAM_GRID
+    param_grid = param_grid or strategy.walk_forward_grid or DEFAULT_PARAM_GRID
+    # Fold the strategy's own exit policy in first, so the grid varies it
+    # rather than being silently overwritten by it.
+    base_cfg = apply_policy(base_cfg, strategy.policy)
+    # Indicators are causal, so handing a window extra 1h history before its
+    # start only warms them up — entries still come from its own 15m bars.
+    # The 4h trend needs ~300 4h bars (50 days) before EMA200 means anything;
+    # without this every test fold would be too short to trade at all.
+    warmup = pd.Timedelta(days=60) if strategy.needs_4h_history else pd.Timedelta(0)
     folds = make_folds(df_15m, n_folds)
     keys = list(param_grid.keys())
     combos = [dict(zip(keys, vals)) for vals in product(*param_grid.values())]
@@ -162,9 +170,9 @@ def run_walk_forward(
     wf_result = WalkForwardResult(metric=metric)
     for fold in folds:
         train_15m = _slice_by_time(df_15m, *fold.train_range)
-        train_1h = _slice_by_time(df_1h, fold.train_range[0], fold.train_range[1])
+        train_1h = _slice_by_time(df_1h, fold.train_range[0] - warmup, fold.train_range[1])
         test_15m = _slice_by_time(df_15m, *fold.test_range)
-        test_1h = _slice_by_time(df_1h, fold.test_range[0], fold.test_range[1])
+        test_1h = _slice_by_time(df_1h, fold.test_range[0] - warmup, fold.test_range[1])
 
         best_params, best_summary, best_score = None, None, float("-inf")
         for combo in combos:

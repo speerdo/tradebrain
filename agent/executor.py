@@ -69,6 +69,10 @@ class PaperPosition:
     # mode's open row for the same product. Carrying the id removes the
     # guesswork entirely.
     trade_id: int = 0
+    signal_id: int | None = None  # the signals row this trade came from
+    # The stop the trade was opened with — its planned risk. `stop_loss` is
+    # the CURRENT stop and moves as breakeven / the trail ratchets it.
+    original_stop: float = 0.0
     # Exchange order identities (live only; empty in paper).
     client_order_id: str = ""     # ours — survives a timed-out request
     entry_order_id: str = ""
@@ -125,7 +129,7 @@ class Executor:
         margin_usdc: float, leverage: int, risk_usdc: float,
         strategy: str = "", confidence: float = 0.0, reasoning: str = "",
         display_name: str = "", product_type: str = "perp",
-        contracts: int = 0,
+        contracts: int = 0, signal_id: int | None = None,
     ) -> OrderResult:
         # The hard mode check, at the one place every entry passes through.
         # `paper` is read ONCE here and carried into the branch, so a config
@@ -140,12 +144,12 @@ class Executor:
             return await self._enter_paper(
                 symbol, display_name or symbol, direction, entry_price,
                 stop_loss, take_profit, size_usdc, margin_usdc, leverage,
-                risk_usdc, strategy, confidence, reasoning, contracts,
+                risk_usdc, strategy, confidence, reasoning, contracts, signal_id,
             )
         return await self._enter_live(
             symbol, display_name or symbol, direction, entry_price,
             stop_loss, take_profit, size_usdc, margin_usdc, leverage,
-            risk_usdc, strategy, confidence, reasoning, contracts,
+            risk_usdc, strategy, confidence, reasoning, contracts, signal_id,
         )
 
     def _guard(self, pos_is_paper: bool, action: str) -> str:
@@ -159,7 +163,8 @@ class Executor:
                             entry_price: float, stop_loss: float, take_profit: float,
                             size_usdc: float, margin_usdc: float, leverage: int,
                             risk_usdc: float, strategy: str, confidence: float,
-                            reasoning: str, contracts: int = 0) -> OrderResult:
+                            reasoning: str, contracts: int = 0,
+                            signal_id: int | None = None) -> OrderResult:
         # is_paper=True is about to be stamped on this position — refuse if
         # the agent is actually LIVE. This is the mismatch that made a real
         # account report simulated trades.
@@ -175,7 +180,7 @@ class Executor:
             size_usdc=size_usdc, margin_usdc=margin_usdc, leverage=leverage,
             risk_usdc=risk_usdc, strategy=strategy, confidence=confidence,
             reasoning=reasoning, is_paper=True, fees_usdc=entry_fee,
-            contracts=contracts,
+            contracts=contracts, signal_id=signal_id, original_stop=stop_loss,
         )
         self.paper_positions[product_id] = pos
         logger.info(
@@ -330,7 +335,7 @@ class Executor:
         entry_price: float, stop_loss: float, take_profit: float,
         size_usdc: float, margin_usdc: float, leverage: int,
         risk_usdc: float, strategy: str, confidence: float,
-        reasoning: str, contracts: int = 0,
+        reasoning: str, contracts: int = 0, signal_id: int | None = None,
     ) -> OrderResult:
         """Place a real CFM market order + exchange-native protective stop."""
         # is_paper=False is about to be stamped — refuse if the agent is in
@@ -403,6 +408,7 @@ class Executor:
                 is_paper=False, fees_usdc=self.fee_for_leg(live_notional),
                 contracts=contracts,
                 client_order_id=client_order_id, entry_order_id=entry_id,
+                signal_id=signal_id, original_stop=stop_loss,
             )
             self.live_positions[product_id] = pos
             self.live_meta[product_id] = {
@@ -496,6 +502,17 @@ class Executor:
             )
         finally:
             meta.pop("stop_order_id", None)
+
+    async def persist_stop(self, pos: PaperPosition) -> None:
+        """Save a ratcheted stop to the trade row (both modes), so a restart
+        restores the trail instead of the entry-time stop."""
+        if not pos.trade_id:
+            return
+        try:
+            db = await get_db()
+            await db.update_trade_stop(pos.trade_id, pos.stop_loss)
+        except Exception as exc:
+            logger.warning(f"Could not persist stop for {pos.display_name}: {exc}")
 
     async def sync_live_stop(self, pos: PaperPosition) -> None:
         """
@@ -837,7 +854,7 @@ class Executor:
                 """
                 SELECT * FROM trades
                 WHERE status = 'open' AND is_paper = TRUE
-                  AND created_at >= NOW() - INTERVAL '7 days'
+                  AND created_at >= NOW() - INTERVAL '60 days'
                 ORDER BY created_at ASC
                 """
             )
@@ -865,7 +882,8 @@ class Executor:
                 display_name=row["display_name"] or row["symbol"],
                 direction=row["direction"],
                 entry_price=float(row["entry_price"]),
-                stop_loss=float(row["stop_loss"] or 0.0),
+                stop_loss=float(row["current_stop"] or row["stop_loss"] or 0.0),
+                original_stop=float(row["stop_loss"] or 0.0),
                 take_profit=float(row["take_profit"] or 0.0),
                 size_usdc=float(row["size_usdc"]),
                 margin_usdc=float(row["margin_usdc"] or 0.0),
@@ -915,7 +933,7 @@ class Executor:
                 """
                 SELECT * FROM trades
                 WHERE status = 'open' AND is_paper = FALSE
-                  AND created_at >= NOW() - INTERVAL '30 days'
+                  AND created_at >= NOW() - INTERVAL '60 days'
                 ORDER BY created_at ASC
                 """
             )
@@ -933,7 +951,8 @@ class Executor:
                 display_name=row["display_name"] or row["symbol"],
                 direction=row["direction"],
                 entry_price=float(row["entry_price"]),
-                stop_loss=float(row["stop_loss"] or 0.0),
+                stop_loss=float(row["current_stop"] or row["stop_loss"] or 0.0),
+                original_stop=float(row["stop_loss"] or 0.0),
                 take_profit=float(row["take_profit"] or 0.0),
                 size_usdc=float(row["size_usdc"]),
                 margin_usdc=float(row["margin_usdc"] or 0.0),
@@ -1024,6 +1043,7 @@ class Executor:
                 "contracts": pos.contracts,
                 "client_order_id": pos.client_order_id or None,
                 "stop_order_id": stop_order_id,
+                "signal_id": pos.signal_id,
             })
         except Exception as exc:
             logger.warning(f"Failed to log trade: {exc}")

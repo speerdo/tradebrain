@@ -17,6 +17,50 @@ class SignalResult:
     invalidation: str = ""    # what would cancel the setup
     parse_failed: bool = False  # LLM output was malformed — "none" is NOT a real no-signal
     raw_response_snippet: str = ""  # first 200 chars of unparseable / errored LLM output
+    # Start (epoch seconds) of the closed higher-timeframe bar the signal was
+    # read from. Bar-based strategies (trend_4h) fire once per bar: without
+    # this, a breakout bar would re-signal on every 2-minute tick for 4 hours.
+    bar_time: float | None = None
+    # signals-table row id, so the outcome (entered / why skipped) can be
+    # written back once risk and execution have had their say.
+    signal_id: int | None = None
+    skip_reason: str = ""
+
+
+@dataclass(frozen=True)
+class TradePolicy:
+    """
+    Per-strategy stop, target and exit management.
+
+    The 15m strategies share one set of exit rules (breakeven at +1.5R, a
+    trail capped at the original risk, a 12h time exit) that were tuned for
+    trades lasting hours. A 4h trend trade lasts days and makes its money on
+    the rare 10R+ runner, so each of those rules would cut exactly the trades
+    it needs. A strategy with `policy = None` keeps the shared rules
+    (position_monitor's module constants and the config's atr_multiplier /
+    take_profit_rr); one that sets a policy gets these instead, in the
+    position monitor and the backtester alike.
+    """
+    stop_atr_mult: float | None = None     # None -> config.atr_multiplier
+    atr_timeframe: str = "15m"             # which ATR the stop and trail use: "15m" | "4h"
+    take_profit_rr: float | None = None    # None -> config.take_profit_rr
+    breakeven_at_r: float | None = 1.5     # None disables the breakeven move
+    trail_activate_r: float = 1.5
+    trail_atr_mult: float = 2.0
+    trail_capped_at_risk: bool = True      # never trail looser than the original stop distance
+    # "tick": ratchet on every monitor tick. "4h": ratchet once per closed 4h
+    # bar off the peak since entry — the chandelier exit as backtested, and
+    # at most six exchange stop replacements a day.
+    trail_update: str = "tick"
+    max_hold_h: float | None = 12.0        # None disables the time exit
+    time_exit_min_r: float = 0.5
+    # The 1h-EMA50 trend filter and 4h-EMA50 bias gate in main.py were added
+    # for the 15m strategies; a strategy with its own trend definition opts out.
+    legacy_trend_filters: bool = True
+    # LosingSymbolLock benches a symbol at -2R over 7 days. At a ~36% win
+    # rate that is two ordinary losses, and ETH is the only symbol a small
+    # account can trade — it would bench the strategy most weeks.
+    losing_symbol_lock: bool = True
 
 
 class BaseStrategy(ABC):
@@ -43,6 +87,12 @@ class BaseStrategy(ABC):
     name: str = ""
     description: str = ""
     compatible_regimes: set[str] | None = None  # None = all regimes OK
+    policy: TradePolicy | None = None  # None = the shared 15m exit rules
+    # Set when check_entry reads indicators["4h_trend"] — main.py then fetches
+    # enough 2h history to build it (one request is only 150 4h bars).
+    needs_4h_history: bool = False
+    # Walk-forward grid over BacktestConfig fields; None = the default grid.
+    walk_forward_grid: dict[str, list[float]] | None = None
 
     @abstractmethod
     def build_prompt(self, indicators: dict, symbol: str,

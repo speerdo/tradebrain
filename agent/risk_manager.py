@@ -300,9 +300,13 @@ class Protections:
         self._maybe_reset_day()
         self._entries_today.append(time.time())
 
-    def check(self, symbol: str, params: RiskParams) -> str:
+    def check(self, symbol: str, params: RiskParams,
+              losing_symbol_lock: bool = True) -> str:
         """
         Returns "" if allowed, or a skip reason string.
+
+        `losing_symbol_lock=False` skips the bench (steps 3 and 5) for
+        strategies whose TradePolicy opts out of it.
         """
         now = time.time()
 
@@ -318,7 +322,7 @@ class Protections:
             return f"Symbol cooldown ({remaining:.0f}m left)"
 
         # 3. LosingSymbolLock — benched symbols
-        if symbol in self._benched:
+        if losing_symbol_lock and symbol in self._benched:
             return "Symbol benched (LosingSymbolLock) until weekly review"
 
         # 4. StoplossGuard trip — count stop-outs in lookback window
@@ -334,7 +338,7 @@ class Protections:
 
         # 5. LosingSymbolLock threshold check (≤ -2R cumulative → bench)
         cum_r = sum(r for _, r in self._symbol_cum_r.get(symbol, []))
-        if cum_r <= params.losing_symbol_threshold_r:
+        if losing_symbol_lock and cum_r <= params.losing_symbol_threshold_r:
             self._benched.add(symbol)
             logger.warning(f"LosingSymbolLock: {symbol} cumR={cum_r:.2f} → benched")
             return f"Symbol benched (cumR {cum_r:.2f} ≤ {params.losing_symbol_threshold_r})"
@@ -553,7 +557,8 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def check_trade_allowed(self, signal: Any, symbol: str,
-                            open_positions: list | None = None) -> str:
+                            open_positions: list | None = None,
+                            losing_symbol_lock: bool = True) -> str:
         """
         Returns empty string if allowed, otherwise returns skip reason.
 
@@ -576,7 +581,7 @@ class RiskManager:
             return f"Confidence {signal.confidence:.2f} < {self.state.min_confidence}"
 
         # --- Protections (B1) ---
-        prot_skip = self.protections.check(symbol, self.state)
+        prot_skip = self.protections.check(symbol, self.state, losing_symbol_lock)
         if prot_skip:
             return prot_skip
 
@@ -748,6 +753,8 @@ class RiskManager:
     def calculate_trade_params(self, direction: str, entry_price: float,
                                atr: float | None,
                                spec: ContractSpec | None = None,
+                               atr_mult: float | None = None,
+                               take_profit_rr: float | None = None,
                                ) -> tuple[float, float, float, float, float, int]:
         """Returns (stop_loss, take_profit, notional_size, margin_required,
         risk_usdc, contracts).
@@ -761,13 +768,17 @@ class RiskManager:
         `risk_usdc` is the ACTUAL dollar risk of the sized position — use it,
         don't recompute `balance * risk_pct`: with whole contracts the real
         risk is routinely 1.5-2x the nominal target on a small account.
+
+        `atr_mult` / `take_profit_rr` override the config values — a
+        strategy's TradePolicy passes its own (trend_4h: 3.5x 4h ATR, no
+        target) so the shared 15m knobs don't apply to it.
         """
         sl, tp = compute_stops(
             entry_price, atr,
-            atr_mult=self.state.atr_multiplier,
+            atr_mult=atr_mult if atr_mult is not None else self.state.atr_multiplier,
             fixed_pct=self.state.fixed_stop_pct,
             method=self.state.stop_loss_method,
-            rr=self.state.take_profit_rr,
+            rr=take_profit_rr if take_profit_rr is not None else self.state.take_profit_rr,
             direction=direction,
             min_stop_pct=self.state.min_stop_pct,
         )

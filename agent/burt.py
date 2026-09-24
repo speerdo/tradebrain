@@ -40,7 +40,7 @@ TUNABLE_CONFIG: dict[str, dict] = {
     "fixed_stop_pct":    {"type": "float",  "min": 0.005, "max": 0.10},
     "stop_loss_method":  {"type": "enum",   "choices": ["atr", "fixed"]},
     "signal_model":      {"type": "str",    "min": None, "max": None},
-    "strategy":          {"type": "enum",   "choices": ["rsi_macd", "bollinger", "ema_pullback", "donchian_breakout"]},
+    "strategy":          {"type": "enum",   "choices": ["trend_4h", "rsi_macd", "bollinger", "ema_pullback", "donchian_breakout"]},
     "signal_interval":   {"type": "int",    "min": 60,   "max": 3600},
     "max_watchlist":     {"type": "int",    "min": 1,    "max": 20},
     # Whole-contract sizing ceilings (see config.py)
@@ -92,7 +92,7 @@ TOOLS = [
                 "daily_loss_limit (0.01-0.20), min_confidence (0.30-0.95 — LOWER means "
                 "Burt takes more trades), atr_multiplier (0.5-5.0), take_profit_rr "
                 "(0.5-10.0), fixed_stop_pct (0.005-0.10), stop_loss_method "
-                "('atr'|'fixed'), strategy ('rsi_macd'|'bollinger'|'ema_pullback'), "
+                "('atr'|'fixed'), strategy ('trend_4h'|'rsi_macd'|'bollinger'|'ema_pullback'|'donchian_breakout'), "
                 "signal_interval (60-3600 sec), max_watchlist (1-20). Always tell the "
                 "user what you changed and why."
             ),
@@ -554,7 +554,11 @@ class Burt:
             "- set_config tunes risk/strategy knobs live. The single biggest lever for "
             "trade frequency is min_confidence — drop it (e.g. 0.50) to take more "
             "trades, raise it to be picky. Always tell the user what you changed.\n"
-            "- Strategy selector — match to regime: rsi_macd (trending momentum reversals), "
+            "- Strategy selector: trend_4h (4h Donchian breakout, long-only, chandelier "
+            "trail; ~2 trades/month, ~40% win rate, big winners) is the ONLY strategy that "
+            "backtested positive out-of-sample after fees — every 15m strategy below lost "
+            "money. Don't switch away from it, or loosen it to trade more often, without "
+            "saying so plainly. The 15m ones: rsi_macd (trending momentum reversals), "
             "bollinger (range-bound mean reversion — DANGEROUS in strong trends), "
             "ema_pullback (continuation in established trends), donchian_breakout "
             "(volatility-expansion / range breakouts — the cleanest fit for leverage).\n"

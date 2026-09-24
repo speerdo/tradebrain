@@ -185,6 +185,73 @@ def compute_4h_indicators(df_4h: pd.DataFrame) -> dict:
     }
 
 
+FOUR_HOURS_S = 4 * 3600
+TREND_4H_LOOKBACK = 20       # Donchian breakout window, in 4h bars
+TREND_4H_BIAS_EMA = 200      # long only above this 4h EMA
+
+
+def build_4h_bars(df: pd.DataFrame, now_ts: float | None = None) -> pd.DataFrame:
+    """
+    Resample 1h or 2h candles into UTC-aligned 4h bars (00/04/08/.. UTC) and
+    drop the bar still in progress.
+
+    `aggregate_candles` groups N consecutive rows, so its bar boundaries
+    depend on where the fetch happened to start, and its last bar is
+    usually the in-progress one. A breakout rule on that would trade the
+    close of a candle that hasn't closed. `now_ts` defaults to the last
+    row's own time plus one source bar (i.e. "every row is closed") —
+    backtests pass nothing, live passes time.time().
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    d = df.sort_values("time").set_index("time")
+    bars = d.resample("4h", origin="epoch", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna(subset=["close"]).reset_index()
+    if now_ts is None:
+        step = (d.index[-1] - d.index[-2]) if len(d) > 1 else pd.Timedelta(hours=1)
+        now_ts = (d.index[-1] + step).timestamp()
+    ends = bars["time"].map(pd.Timestamp.timestamp) + FOUR_HOURS_S
+    return bars[ends <= now_ts + 1e-6].reset_index(drop=True)
+
+
+def compute_trend_4h_frame(df_4h: pd.DataFrame) -> pd.DataFrame:
+    """Causal 4h trend columns: prior-20-bar Donchian high/low, EMA200, ATR14."""
+    df = df_4h.copy()
+    df["dc_upper_prev"] = df["high"].rolling(TREND_4H_LOOKBACK, min_periods=TREND_4H_LOOKBACK).max().shift(1)
+    df["dc_lower_prev"] = df["low"].rolling(TREND_4H_LOOKBACK, min_periods=TREND_4H_LOOKBACK).min().shift(1)
+    df["ema200"] = ema(df["close"], length=TREND_4H_BIAS_EMA)
+    df["atr"] = atr(df["high"], df["low"], df["close"], length=14)
+    return df
+
+
+def trend_4h_dict(row, n_bars: int) -> dict:
+    """indicators["4h_trend"] for one closed 4h bar (a Series or dict row)."""
+    def _safe(val):
+        return None if val is None or pd.isna(val) else float(val)
+    t = row["time"]
+    return {
+        "bar_time": pd.Timestamp(t).timestamp(),
+        "close": _safe(row["close"]),
+        "high": _safe(row["high"]),
+        "dc_upper_prev": _safe(row["dc_upper_prev"]),
+        "dc_lower_prev": _safe(row["dc_lower_prev"]),
+        "ema200": _safe(row["ema200"]),
+        "atr": _safe(row["atr"]),
+        # EMA200 needs history to mean anything; check_entry refuses below this.
+        "n_bars": int(n_bars),
+    }
+
+
+def compute_trend_4h(df_lower: pd.DataFrame, now_ts: float | None = None) -> dict:
+    """Live entry point: 1h/2h candles -> the latest CLOSED 4h bar's trend dict."""
+    bars = build_4h_bars(df_lower, now_ts)
+    if bars.empty:
+        return {}
+    frame = compute_trend_4h_frame(bars)
+    return trend_4h_dict(frame.iloc[-1], len(frame))
+
+
 def compute_indicators(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
     """
     Compute all indicators for signal evaluation.

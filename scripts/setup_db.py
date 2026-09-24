@@ -270,6 +270,9 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS filled_contracts FLOAT;
 -- Commission Coinbase actually charged, vs. the modeled taker fee.
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS exchange_fees_usdc FLOAT DEFAULT 0;
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS fills_synced_at TIMESTAMPTZ;
+-- Ratcheted stop (breakeven / trail). stop_loss stays the original stop —
+-- the trade's planned risk — and position restores read this instead.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS current_stop FLOAT;
 
 -- One row per real exchange fill. fill_id is Coinbase's own fill id and is
 -- UNIQUE, so re-syncing a window of history is idempotent — that is what

@@ -16,16 +16,19 @@ Usage:
     print(result.summary())
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from loguru import logger
 
-from agent.indicator_engine import _compute_indicator_df, aggregate_candles, build_indicator_dict, ema
+from agent.indicator_engine import (
+    FOUR_HOURS_S, _compute_indicator_df, aggregate_candles, build_4h_bars,
+    build_indicator_dict, compute_trend_4h_frame, ema, trend_4h_dict,
+)
 from agent.risk_manager import compute_position_size, compute_stops
-from strategies.base import BaseStrategy, SignalResult
+from strategies.base import BaseStrategy, SignalResult, TradePolicy
 
 
 @dataclass
@@ -77,6 +80,37 @@ class BacktestConfig:
     # The prompts already demand this ("ALL THREE STEPS MUST ALIGN") but only
     # the 1h filter was ever enforced server-side.
     require_4h_bias: bool = True         # mirrors config.require_4h_bias
+    # --- Strategy TradePolicy (strategies/base.py) ---
+    atr_timeframe: str = "15m"           # "4h": stop and trail use the 4h ATR
+    trail_capped_at_risk: bool = True
+    trail_update: str = "tick"           # "4h": ratchet once per closed 4h bar off the peak
+    # Set once a strategy's policy has been folded in, so the walk-forward
+    # grid can vary those same fields without the engine resetting them.
+    policy_applied: bool = False
+
+
+def apply_policy(cfg: BacktestConfig, policy: TradePolicy | None) -> BacktestConfig:
+    """Fold a strategy's TradePolicy into a BacktestConfig — the same
+    per-strategy exit rules the live position monitor applies."""
+    if policy is None or cfg.policy_applied:
+        return replace(cfg, policy_applied=True)
+    return replace(
+        cfg,
+        atr_multiplier=policy.stop_atr_mult if policy.stop_atr_mult is not None else cfg.atr_multiplier,
+        take_profit_rr=policy.take_profit_rr if policy.take_profit_rr is not None else cfg.take_profit_rr,
+        atr_timeframe=policy.atr_timeframe,
+        enable_breakeven=policy.breakeven_at_r is not None,
+        breakeven_at_r=policy.breakeven_at_r if policy.breakeven_at_r is not None else cfg.breakeven_at_r,
+        trailing_activate_r=policy.trail_activate_r,
+        trailing_atr_mult=policy.trail_atr_mult,
+        trail_capped_at_risk=policy.trail_capped_at_risk,
+        trail_update=policy.trail_update,
+        enable_time_exit=policy.max_hold_h is not None,
+        max_hold_bars=int(policy.max_hold_h * 4) if policy.max_hold_h is not None else cfg.max_hold_bars,
+        time_exit_min_r=policy.time_exit_min_r,
+        require_4h_bias=cfg.require_4h_bias and policy.legacy_trend_filters,
+        policy_applied=True,
+    )
 
 
 @dataclass
@@ -157,6 +191,7 @@ class _OpenPosition:
         self.remaining_size = trade.size_usdc
         self.realized_partial = 0.0  # gross PnL banked by partial take-profit
         self.bars_held = 0
+        self.peak = trade.entry_price  # best price since entry (chandelier trail)
 
 
 class BacktestEngine:
@@ -166,7 +201,7 @@ class BacktestEngine:
 
     def __init__(self, strategy: BaseStrategy, config: BacktestConfig):
         self.strategy = strategy
-        self.cfg = config
+        self.cfg = apply_policy(config, strategy.policy)
 
     def run(
         self,
@@ -212,6 +247,22 @@ class BacktestEngine:
                 per_1h[j] = 0 if k < 0 else (1 if close_4h[k] > ema50_4h[k] else -1)
             bias_4h = per_1h
 
+        # 4h trend frame (trend_4h): UTC-aligned 4h bars built from the 1h
+        # candles, the same construction live uses on 2h candles. A 4h bar is
+        # usable once the decision time (15m bar close) reaches its end, and
+        # the strategy fires only on the 15m bar where a NEW 4h bar closed —
+        # live's once-per-bar dedupe.
+        trend_rows: list[dict] | None = None
+        bar_to_4h: np.ndarray | None = None
+        if self.strategy.needs_4h_history:
+            f4 = compute_trend_4h_frame(build_4h_bars(df_1h[["time", "open", "high", "low", "close", "volume"]]))
+            trend_rows = f4.to_dict("records")
+            close_ns = (f4["time"].values.astype("datetime64[ns]").astype("int64")
+                        + int(pd.Timedelta(seconds=FOUR_HOURS_S).value))
+            decision_ns = (df_15m_e["time"].values.astype("datetime64[ns]").astype("int64")
+                           + int(pd.Timedelta(minutes=15).value))
+            bar_to_4h = np.searchsorted(close_ns, decision_ns, side="right") - 1
+
         result = BacktestResult(config=self.cfg)
         open_positions: list[_OpenPosition] = []
         balance = self.cfg.balance_usdc
@@ -224,6 +275,7 @@ class BacktestEngine:
             bar_high = float(current_bar["high"])
             bar_low = float(current_bar["low"])
             bar_time = current_bar["time"]
+            new_4h_close = (pd.Timestamp(bar_time) + pd.Timedelta(minutes=15)).value % (FOUR_HOURS_S * 10**9) == 0
 
             # --- Exit check first (intra-bar: SL/TP hit if high/low crosses) ---
             for op in list(open_positions):
@@ -321,7 +373,11 @@ class BacktestEngine:
 
             # --- Trailing stop / breakeven / partial TP updates (using bar close) ---
             for op in open_positions:
-                self._manage_exits(op, current_price)
+                if op.trade.direction == "long":
+                    op.peak = max(op.peak, bar_high)
+                else:
+                    op.peak = min(op.peak, bar_low)
+                self._manage_exits(op, current_price, new_4h_close)
 
             # --- Entry check ---
             if len(open_positions) < self.cfg.max_concurrent_positions and i >= cooldown_until_bar:
@@ -333,6 +389,10 @@ class BacktestEngine:
                     indicators = build_indicator_dict(
                         rows_15m[i], rows_15m[i - 1], rows_1h[int(bar_to_1h[i])]
                     )
+                    if trend_rows is not None:
+                        k = int(bar_to_4h[i])
+                        fresh = k >= 0 and (i == 0 or k != int(bar_to_4h[i - 1]))
+                        indicators["4h_trend"] = trend_4h_dict(trend_rows[k], k + 1) if fresh else {}
                     if indicators:
                         sig = self.strategy.check_entry(indicators)
                         if bias_4h is not None and sig.direction in ("long", "short"):
@@ -341,7 +401,8 @@ class BacktestEngine:
                                 sig.direction = "none"
                         if sig.direction in ("long", "short") and sig.confidence >= self.cfg.min_confidence:
                             entry = indicators["15m"]["price"]
-                            atr = indicators["15m"]["atr"]
+                            atr = (indicators.get("4h_trend", {}).get("atr")
+                                   if self.cfg.atr_timeframe == "4h" else indicators["15m"]["atr"])
                             sl, tp = compute_stops(
                                 entry, atr,
                                 fixed_pct=self.cfg.fixed_stop_pct,
@@ -437,7 +498,8 @@ class BacktestEngine:
                 return t.take_profit, "take_profit"
         return 0.0, ""
 
-    def _manage_exits(self, op: _OpenPosition, current_price: float) -> None:
+    def _manage_exits(self, op: _OpenPosition, current_price: float,
+                      new_4h_close: bool = False) -> None:
         """Update trailing stop, breakeven, partial TP — stop only ratchets."""
         t = op.trade
         r_multiple = self._r_multiple(op, current_price)
@@ -461,8 +523,23 @@ class BacktestEngine:
         # never be looser than the trade's original risk once active (mirrors
         # the same fix in agent/position_monitor.py; a backtester that doesn't
         # replicate a live fix isn't evidence about live behavior anymore).
+        if self.cfg.trail_update == "4h":
+            # Chandelier: once per closed 4h bar, trail off the best price
+            # since entry (mirrors position_monitor's 4h trail).
+            if self.cfg.enable_trailing and new_4h_close and op.atr_at_entry > 0:
+                trail_dist = op.atr_at_entry * self.cfg.trailing_atr_mult
+                if self.cfg.trail_capped_at_risk:
+                    trail_dist = min(trail_dist, op.stop_distance)
+                if t.direction == "long":
+                    t.stop_loss = max(t.stop_loss, op.peak - trail_dist)
+                else:
+                    t.stop_loss = min(t.stop_loss, op.peak + trail_dist)
+            return
+
         if self.cfg.enable_trailing and r_multiple >= self.cfg.trailing_activate_r and op.atr_at_entry > 0:
-            trail_dist = min(op.atr_at_entry * self.cfg.trailing_atr_mult, op.stop_distance)
+            trail_dist = op.atr_at_entry * self.cfg.trailing_atr_mult
+            if self.cfg.trail_capped_at_risk:
+                trail_dist = min(trail_dist, op.stop_distance)
             if t.direction == "long":
                 new_stop = current_price - trail_dist
                 if new_stop > t.stop_loss:

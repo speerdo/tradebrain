@@ -151,6 +151,18 @@ class Database:
         logger.debug(f"Logged signal {sid} for {signal['symbol']}")
         return sid
 
+    async def update_signal_outcome(self, signal_id: int | None, *,
+                                    acted_on: bool = False, skip_reason: str = "") -> None:
+        """Record what became of a logged signal. Every row used to keep
+        acted_on=false and an empty skip_reason forever, so the table could
+        not say which signals traded or why the rest didn't."""
+        if not signal_id:
+            return
+        await self.execute(
+            "UPDATE signals SET acted_on = $2, skip_reason = $3 WHERE id = $1",
+            signal_id, acted_on, skip_reason[:500],
+        )
+
     async def get_recent_signals(self, limit: int = 100) -> list[asyncpg.Record]:
         return await self.fetch(
             "SELECT * FROM signals ORDER BY created_at DESC LIMIT $1", limit
@@ -213,6 +225,17 @@ class Database:
         "exit_client_order_id", "filled_entry_price", "filled_exit_price",
         "filled_contracts", "exchange_fees_usdc", "fills_synced_at",
     )
+
+    async def update_trade_stop(self, trade_id: int, current_stop: float) -> None:
+        """Persist a ratcheted (breakeven / trailed) stop. `stop_loss` stays
+        the ORIGINAL stop — the trade's planned risk and R denominator — and
+        restores read `current_stop` so a restart doesn't hand a multi-day
+        trend trade back its entry-time stop."""
+        if not trade_id:
+            return
+        await self.execute(
+            "UPDATE trades SET current_stop = $2 WHERE id = $1", trade_id, current_stop,
+        )
 
     async def update_trade_orders(self, trade_id: int, **fields) -> None:
         """

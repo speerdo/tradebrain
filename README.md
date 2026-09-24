@@ -63,11 +63,26 @@ Burt is the agent's personality layer. He's conversational, dry, self-aware, and
 
 ## Strategies
 
-Three built-in strategies provide signal prompts to the AI:
+**Rules decide, the LLM vetoes.** Each strategy's deterministic
+`check_entry()` — the same rule the backtester replays — decides whether there
+is a setup. Only then is the LLM asked, and it can only confirm or veto
+(`llm_veto` in `agent_config`; every veto is recorded in `signals.skip_reason`).
+An LLM error fails open to the rule.
 
-1. **RSI + MACD Momentum** (default) — Trend reversals on 15m with 1h EMA filter
-2. **Bollinger Band Mean Reversion** — Fade overextension back to the mean
-3. **EMA Trend + Pullback** — Enter pullbacks to 20 EMA in strong trends
+1. **4h Donchian Trend** (`trend_4h`) — long-only 20-bar 4h breakout above the
+   4h EMA200, exited only by a 3.5× 4h-ATR chandelier trail (no target, no
+   breakeven, no time exit). The one configuration that tested positive
+   out-of-sample (2023–2026) after fees; ~2 trades/month, ~36–40% win rate.
+   Needs `max_risk_per_trade` ≈ 0.10 on a $200 account (one ETH contract at a
+   ~6% stop risks ~$16).
+2. **RSI + MACD Momentum** — Trend reversals on 15m with 1h EMA filter
+3. **Donchian Breakout (15m)** — 20-bar 15m breakout with volume confirmation
+4. **Bollinger Band Mean Reversion** — Fade overextension back to the mean
+5. **EMA Trend + Pullback** — Enter pullbacks to 20 EMA in strong trends
+
+The 15m strategies are all negative after the 0.14%/fill fee in backtests.
+A strategy can carry its own `TradePolicy` (stops, target, trail, time exit,
+protections — `strategies/base.py`); those without one share the 15m rules.
 
 ## Paper vs Live (they are separate accounts)
 
@@ -233,7 +248,7 @@ Every slider in the sidebar writes to the `agent_config` table and is picked up 
 
 | Knob | Range | Effect |
 |---|---|---|
-| Strategy | rsi_macd / bollinger / ema_pullback | Which prompt template Burt uses |
+| Strategy | trend_4h / rsi_macd / donchian_breakout / bollinger / ema_pullback | Which entry rule (and LLM veto prompt) runs |
 | Leverage | 1–20× | Position notional / margin |
 | Risk/Trade | 0.5–5% of balance | $-at-risk per trade |
 | Daily Loss Limit | 1–20% | Trips the circuit breaker |
@@ -285,8 +300,10 @@ tradebrain/
 │   ├── burt.py              # Personality + Discord bot
 │   └── memory_engine.py     # Semantic memory + RAG
 ├── strategies/
-│   ├── base.py              # BaseStrategy ABC
+│   ├── base.py              # BaseStrategy ABC + TradePolicy
+│   ├── trend_4h.py          # 4h Donchian trend, chandelier exit
 │   ├── rsi_macd.py
+│   ├── donchian_breakout.py
 │   ├── bollinger.py
 │   └── ema_pullback.py
 ├── ui/                      # SvelteKit 2 dashboard

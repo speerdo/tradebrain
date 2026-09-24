@@ -25,6 +25,8 @@ from agent.executor import Executor, PaperPosition
 from agent.coinbase_client import CoinbaseClient
 from agent.database import get_db
 from agent.risk_manager import RiskManager
+from strategies import STRATEGIES
+from strategies.base import TradePolicy
 import config
 
 
@@ -62,6 +64,25 @@ ENABLE_PARTIAL_TP = False
 # Force-close at MAX_HOLD_H only when the position hasn't paid — closing
 # winners at the deadline was converting +1R runners into 0R time exits.
 TIME_EXIT_MIN_R = 0.5
+
+# The rules above, as a policy — what every strategy without its own
+# TradePolicy (all the 15m ones) gets, unchanged.
+SHARED_POLICY = TradePolicy(
+    breakeven_at_r=BREAKEVEN_AT_R,
+    trail_activate_r=TRAILING_ACTIVATE_R,
+    trail_atr_mult=TRAILING_ATR_MULT,
+    trail_capped_at_risk=True,
+    trail_update="tick",
+    max_hold_h=MAX_HOLD_H,
+    time_exit_min_r=TIME_EXIT_MIN_R,
+)
+FOUR_HOURS_S = 4 * 3600
+
+
+def policy_for(strategy_name: str) -> TradePolicy:
+    strat = STRATEGIES.get(strategy_name)
+    return (strat.policy if strat is not None and strat.policy is not None
+            else SHARED_POLICY)
 
 
 @dataclass
@@ -110,12 +131,15 @@ class PositionMonitor:
             self._task.cancel()
 
     def record_entry(self, pos: PaperPosition, atr: float | None) -> None:
-        """Called when a new position opens — store meta for exit management."""
+        """Called when a new position opens — store meta for exit management.
+        `atr` must be the ATR the strategy's policy trails on (4h for trend_4h)."""
         self._pos_meta[pos.product_id] = {
             "atr": atr or 0.0,
-            "original_stop": pos.stop_loss,
+            "original_stop": pos.original_stop or pos.stop_loss,
             "original_size": pos.size_usdc,
             "partial_done": False,
+            "peak": pos.entry_price,
+            "trail_bucket": int(time.time() // FOUR_HOURS_S),
         }
 
     async def _loop(self) -> None:
@@ -169,11 +193,13 @@ class PositionMonitor:
             # --- Exit management (B2): update stops before evaluating ---
             prev_stop = pos.stop_loss
             await self._manage_exits(pos, price)
-            # Live: keep the exchange-native crash stop aligned with the stop
-            # the bot just ratcheted, or the protection left on the exchange
-            # is the stale (wider) level if the bot dies.
-            if not pos.is_paper and pos.stop_loss != prev_stop:
-                await self.executor.sync_live_stop(pos)
+            if pos.stop_loss != prev_stop:
+                await self.executor.persist_stop(pos)
+                # Live: keep the exchange-native crash stop aligned with the
+                # stop the bot just ratcheted, or the protection left on the
+                # exchange is the stale (wider) level if the bot dies.
+                if not pos.is_paper:
+                    await self.executor.sync_live_stop(pos)
 
             snap = self._evaluate(pos, price)
             if snap.status != "open":
@@ -184,15 +210,23 @@ class PositionMonitor:
 
     async def _manage_exits(self, pos: PaperPosition, price: float) -> None:
         """Apply partial take-profit + breakeven + trailing stop ratchets (B2)."""
+        policy = policy_for(pos.strategy)
         meta = self._pos_meta.get(pos.product_id)
         if meta is None:
-            # Position opened before monitor was aware (e.g. restart) — bootstrap
-            atr_mult = float(getattr(self.risk.state, "atr_multiplier", 0) or 0) or 3.0
+            # Position opened before monitor was aware (e.g. restart, or any
+            # live entry) — bootstrap from the ORIGINAL stop, which the entry
+            # set at atr * the policy's multiplier.
+            original_stop = pos.original_stop or pos.stop_loss
+            atr_mult = policy.stop_atr_mult or float(getattr(self.risk.state, "atr_multiplier", 0) or 0) or 3.0
             meta = {
-                "atr": abs(pos.entry_price - pos.stop_loss) / atr_mult if pos.stop_loss else 0.0,
-                "original_stop": pos.stop_loss,
+                "atr": abs(pos.entry_price - original_stop) / atr_mult if original_stop else 0.0,
+                "original_stop": original_stop,
                 "original_size": pos.size_usdc,
                 "partial_done": True,  # skip partial TP for bootstrap positions
+                # The peak before a restart is unknown; the persisted stop
+                # already carries whatever the trail had locked in.
+                "peak": price,
+                "trail_bucket": int(time.time() // FOUR_HOURS_S),
             }
             self._pos_meta[pos.product_id] = meta
 
@@ -259,7 +293,8 @@ class PositionMonitor:
         # will itself cost. Without the buffer, a stop hit exactly at entry
         # is a guaranteed net loser once real fees apply — "breakeven" in
         # name only.
-        if r_mult >= BREAKEVEN_AT_R and pos.size_usdc > 0:
+        if (policy.breakeven_at_r is not None and r_mult >= policy.breakeven_at_r
+                and pos.size_usdc > 0):
             fee_buffer_usdc = pos.fees_usdc + self.executor.fee_for_leg(pos.size_usdc)
             fee_buffer_price = fee_buffer_usdc / pos.size_usdc * pos.entry_price
             if pos.direction == "long":
@@ -284,8 +319,38 @@ class PositionMonitor:
         # the trail sat 2.0×ATR behind price while the trade was only ever
         # risking 1.5×ATR. Capping at stop_distance keeps the trail at least
         # as tight as the trade's own risk once it's protecting gains.
-        if r_mult >= TRAILING_ACTIVATE_R and atr > 0:
-            trail_dist = min(atr * TRAILING_ATR_MULT, stop_distance)
+        if pos.direction == "long":
+            meta["peak"] = max(meta.get("peak", price), price)
+        else:
+            meta["peak"] = min(meta.get("peak", price), price)
+
+        if policy.trail_update == "4h":
+            # Chandelier exit, as backtested: once per closed 4h bar, move the
+            # stop to (best price since entry) -/+ trail_atr_mult * ATR. Per
+            # bar rather than per tick also caps live stop replacements at 6/day.
+            bucket = int(time.time() // FOUR_HOURS_S)
+            if bucket == meta.get("trail_bucket") or atr <= 0 or r_mult < policy.trail_activate_r:
+                return
+            meta["trail_bucket"] = bucket
+            trail_dist = atr * policy.trail_atr_mult
+            if policy.trail_capped_at_risk:
+                trail_dist = min(trail_dist, stop_distance)
+            if pos.direction == "long":
+                new_stop = meta["peak"] - trail_dist
+                if new_stop > pos.stop_loss:
+                    logger.info(f"📈 {pos.display_name} 4h trail → {new_stop:.2f} (peak {meta['peak']:.2f})")
+                    pos.stop_loss = new_stop
+            else:
+                new_stop = meta["peak"] + trail_dist
+                if new_stop < pos.stop_loss:
+                    logger.info(f"📉 {pos.display_name} 4h trail → {new_stop:.2f} (peak {meta['peak']:.2f})")
+                    pos.stop_loss = new_stop
+            return
+
+        if r_mult >= policy.trail_activate_r and atr > 0:
+            trail_dist = atr * policy.trail_atr_mult
+            if policy.trail_capped_at_risk:
+                trail_dist = min(trail_dist, stop_distance)
             if pos.direction == "long":
                 new_stop = price - trail_dist
                 if new_stop > pos.stop_loss:
@@ -312,9 +377,10 @@ class PositionMonitor:
         # A winner past the deadline keeps running — its trailed stop is the
         # exit, not the clock. R is measured against the ORIGINAL stop (meta),
         # not the current (breakeven/trailed) stop.
-        if status == "open":
+        policy = policy_for(pos.strategy)
+        if status == "open" and policy.max_hold_h is not None:
             hold_h = (time.time() - pos.opened_at) / 3600
-            if hold_h >= MAX_HOLD_H:
+            if hold_h >= policy.max_hold_h:
                 meta = self._pos_meta.get(pos.product_id, {})
                 original_stop = meta.get("original_stop", pos.stop_loss)
                 stop_distance = abs(pos.entry_price - original_stop)
@@ -324,11 +390,11 @@ class PositionMonitor:
                     r_mult = (price - pos.entry_price) / stop_distance
                 else:
                     r_mult = (pos.entry_price - price) / stop_distance
-                if r_mult < TIME_EXIT_MIN_R:
+                if r_mult < policy.time_exit_min_r:
                     status = "time_exit"
                 else:
                     logger.debug(
-                        f"{pos.display_name} past {MAX_HOLD_H:.0f}h at "
+                        f"{pos.display_name} past {policy.max_hold_h:.0f}h at "
                         f"+{r_mult:.2f}R — letting the runner continue"
                     )
 
