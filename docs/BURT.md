@@ -117,7 +117,7 @@ The last 20 messages from the current Discord conversation. Always included in t
 prompt for conversational continuity. Stored in-memory during the session.
 
 **Tier 2 — Episodic memory (structured DB)**
-Every trade, signal, and significant event stored in Neon. Queryable by recency,
+Every trade, signal, and significant event stored in Postgres. Queryable by recency,
 symbol, strategy, outcome, and date. Used for stats, summaries, and fact-retrieval.
 This is already covered in BLUEPRINT.md (trades and signals tables).
 
@@ -177,8 +177,8 @@ CREATE INDEX idx_memories_embedding ON memories
 USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 ```
 
-**Enable pgvector on Neon:**
-Neon supports pgvector natively. Run once:
+**Enable pgvector in Postgres:**
+Run once as superuser (the local template DB already has it):
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
@@ -560,7 +560,7 @@ Add to requirements.txt from BLUEPRINT.md:
 
 ```
 discord.py>=2.3.0          # Discord bot
-pgvector>=0.2.4            # pgvector Python client for Neon
+pgvector>=0.2.4            # pgvector Python client
 pytz>=2024.1               # timezone handling for active hours
 ```
 
@@ -590,7 +590,7 @@ BURT_ACTIVE_HOURS_END=22        # 10 PM ET
    Do NOT run it in a separate thread. Use `discord.Client` not `commands.Bot` since
    Burt interprets natural language, not slash commands.
 
-2. **pgvector on Neon**: Enable with `CREATE EXTENSION IF NOT EXISTS vector`. Use
+2. **pgvector**: Enable with `CREATE EXTENSION IF NOT EXISTS vector`. Use
    `asyncpg` with the `pgvector` Python package for type registration. Register the
    vector type on the connection pool after connecting.
 

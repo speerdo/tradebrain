@@ -1,6 +1,6 @@
 """
 Database schema setup script for TradeBrain.
-Run once to create all tables, extensions, and indexes on Neon Postgres.
+Run once to create all tables, extensions, and indexes on Postgres (local 17 cluster on :5433 — see docs/LOCAL_POSTGRES_PLAN.md).
 """
 
 import asyncio

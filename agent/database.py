@@ -1,5 +1,5 @@
 """
-TradeBrain Database Layer — Neon Postgres
+TradeBrain Database Layer — Postgres (local, see docs/LOCAL_POSTGRES_PLAN.md)
 
 Handles asyncpg pool, schema creation, and CRUD for all tables.
 pgvector is used for semantic memory (memories.embedding).
@@ -26,7 +26,7 @@ _DANGEROUS_SQL = re.compile(
 
 
 class Database:
-    """Singleton-style Neon database manager."""
+    """Singleton-style Postgres database manager."""
 
     def __init__(self, dsn: str | None = None):
         self.cfg = config.get_config()
@@ -47,7 +47,7 @@ class Database:
             max_size=10,
             command_timeout=30,
         )
-        logger.info("Connected to Neon DB")
+        logger.info("Connected to Postgres")
         # pgvector type registration on first connection
         async with self.pool.acquire() as conn:
             try:
@@ -59,7 +59,7 @@ class Database:
         if self.pool:
             await self.pool.close()
             self.pool = None
-            logger.info("Closed Neon DB pool")
+            logger.info("Closed Postgres pool")
 
     async def execute(self, sql: str, *args) -> Any:
         """Low-level execute. Ensure connected first."""

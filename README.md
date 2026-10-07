@@ -11,7 +11,7 @@ TradeBrain is a personal, locally-run AI trading agent for **Coinbase Financial 
 
 ### Meet Burt
 
-Burt is the agent's personality layer. He's conversational, dry, self-aware, and remembers your past trades. He talks to you like a slightly nerdy friend who knows a lot about trading. He runs in Discord, sends proactive updates, learns from outcomes, and forms long-term semantic memories (powered by pgvector embeddings on Neon).
+Burt is the agent's personality layer. He's conversational, dry, self-aware, and remembers your past trades. He talks to you like a slightly nerdy friend who knows a lot about trading. He runs in Discord, sends proactive updates, learns from outcomes, and forms long-term semantic memories (powered by pgvector embeddings in Postgres).
 
 ## Key Capabilities
 
@@ -26,7 +26,7 @@ Burt is the agent's personality layer. He's conversational, dry, self-aware, and
 | Discord Bot (Burt personality) | ✅ Skeleton ready — needs `DISCORD_BOT_TOKEN` |
 | Semantic Memory (pgvector) | ✅ Full implementation |
 | SvelteKit Dashboard | ✅ Built with Svelte 5 runes |
-| Neon Postgres Logging | ✅ All tables created |
+| Postgres Logging | ✅ All tables created |
 
 ## Architecture
 
@@ -41,7 +41,7 @@ Burt is the agent's personality layer. He's conversational, dry, self-aware, and
 ├─────────────────────────────────────────────────────────────┤
 │  Position Monitor (30s) | Burt Bot (Discord) | FastAPI    │
 │       ↓                        ↓                  ↓         │
-│   Neon DB                  Neon DB            SvelteKit    │
+│   Postgres                 Postgres           SvelteKit    │
 │   (trades, signals,        (memories,          Dashboard   │
 │    screener, config)        discord_msgs)       localhost  │
 └─────────────────────────────────────────────────────────────┘
@@ -57,7 +57,7 @@ Burt is the agent's personality layer. He's conversational, dry, self-aware, and
 | Indicators | Manual pandas implementation (RSI, MACD, BB, ATR, EMA) |
 | Backend API | FastAPI + uvicorn |
 | Frontend | SvelteKit 2 + Svelte 5 runes |
-| Database | Neon Postgres + pgvector |
+| Database | Postgres 17 (local) + pgvector |
 | Notifications | Discord webhook + discord.py bot |
 | Language | Python 3.11+ / TypeScript |
 
@@ -265,7 +265,7 @@ If you're getting no trades in a flat market, drop **Min Confidence** to ~0.5 �
 
 | Variable | Status | Where to Get |
 |---|---|---|
-| `DATABASE_URL` | ✅ Ready | [neon.tech](https://neon.tech) |
+| `DATABASE_URL` | ✅ Ready | Local Postgres — see `docs/LOCAL_POSTGRES_PLAN.md` |
 | `OPENROUTER_API_KEY` | ✅ Ready | [openrouter.ai](https://openrouter.ai) |
 | `COINBASE_API_KEY` | ✅ Ready | [portal.cdp.coinbase.com](https://portal.cdp.coinbase.com) — CDP key name |
 | `COINBASE_API_SECRET` | ✅ Ready | Same as above — EC private key PEM |
@@ -295,7 +295,7 @@ tradebrain/
 │   ├── position_monitor.py  # Track open positions
 │   ├── maintenance.py       # Friday/quarterly maintenance window check
 │   ├── regime.py            # BTC dominance + market regime context
-│   ├── database.py          # Neon asyncpg client
+│   ├── database.py          # Postgres asyncpg client
 │   ├── notifier.py          # Discord notifications
 │   ├── burt.py              # Personality + Discord bot
 │   └── memory_engine.py     # Semantic memory + RAG
